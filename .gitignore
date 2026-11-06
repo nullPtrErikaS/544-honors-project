@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Generated protobuf/gRPC code (built from mapreduce/mr.proto)
+mapreduce/mr_pb2.py
+mapreduce/mr_pb2.pyi
+mapreduce/mr_pb2_grpc.py
+
+# Local scratch data
+/scratch/
+/data/
+*.log

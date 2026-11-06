@@ -1,0 +1,3 @@
+# Keep LF endings everywhere so scripts work inside Linux containers.
+* text=auto eol=lf
+*.png binary
