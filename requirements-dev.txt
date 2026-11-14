@@ -1,0 +1,3 @@
+# Tests, lint, and benchmark plotting (not needed to run the system).
+pytest==9.2.0
+ruff==0.17.5
