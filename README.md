@@ -179,7 +179,7 @@ some/local/dir`. A second example,
 ```bash
 ./mr submit --input inputs/sample --output outputs/index \
             --job examples/jobs/inverted_index.py --maps 4 --reduces 2
-./mr cat outputs/index | grep '^worker'
+./mr cat outputs/index | awk -F'\t' '$1 == "worker"'
 # worker	["inputs/sample/docker.txt", "inputs/sample/mapreduce.txt"]
 ```
 
