@@ -109,6 +109,7 @@ class Client:
         *,
         overwrite: bool = False,
         speculation: bool = True,
+        combiner: bool = True,
     ) -> str:
         source = job_file.read_text(encoding="utf-8")
         jobcode.top_level_names(source, job_file.name)  # fail fast on obvious mistakes
@@ -121,6 +122,7 @@ class Client:
             num_reduce_tasks=reduces,
             overwrite_output=overwrite,
             speculative_execution=speculation,
+            use_combiner=combiner,
         )
         return self.stub.SubmitJob(request).job_id
 
@@ -189,7 +191,11 @@ def print_status(s: mr_pb2.JobStatus, attempts: bool = True) -> None:
     print(f"  output:   {s.output_path}")
     print(f"  maps:     {s.maps_done}/{s.num_map_tasks}")
     print(f"  reduces:  {s.reduces_done}/{s.num_reduce_tasks}")
-    print(f"  options:  speculation {'on' if s.speculative_execution else 'off'}")
+    onoff = {True: "on", False: "off"}
+    print(
+        f"  options:  combiner {onoff[s.use_combiner]}, "
+        f"speculation {onoff[s.speculative_execution]}"
+    )
     backups = [a for a in s.attempts if a.speculative]
     if backups:
         won = sum(a.state == mr_pb2.ATTEMPT_SUCCEEDED for a in backups)
@@ -254,6 +260,7 @@ def cmd_submit(client: Client, args) -> int:
         args.reduces,
         overwrite=args.overwrite,
         speculation=not args.no_speculation,
+        combiner=not args.no_combiner,
     )
     if args.detach:
         print(job_id)
@@ -376,6 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-speculation", action="store_true", help="never launch backup tasks for stragglers"
     )
+    p.add_argument("--no-combiner", action="store_true", help="ignore the job's combiner function")
     p.add_argument("--detach", action="store_true", help="print the job id and exit")
     p.set_defaults(func=cmd_submit)
 

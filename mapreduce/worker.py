@@ -118,7 +118,13 @@ class Worker:
             segments = [Segment(s.path, s.start, s.end) for s in a.segments]
             out_dir = storage.resolve(self.root, a.output_dir)
             return run_map_task(
-                job, self.root, segments, a.num_reduce_tasks, out_dir, cancel=cancel
+                job,
+                self.root,
+                segments,
+                a.num_reduce_tasks,
+                out_dir,
+                use_combiner=a.use_combiner,
+                cancel=cancel,
             )
         inputs = [storage.resolve(self.root, d) for d in a.map_output_dirs]
         out_file = storage.resolve(self.root, a.output_file)

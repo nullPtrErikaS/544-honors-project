@@ -73,6 +73,7 @@ class JobSpec:
     num_maps: int
     num_reduces: int
     speculative: bool = True  # launch backup attempts for stragglers
+    use_combiner: bool = False  # run the job's combiner on map output
 
 
 @dataclass(eq=False)
@@ -162,6 +163,7 @@ class Assignment:
     map_output_dirs: list[str]
     output_dir: str
     output_file: str
+    use_combiner: bool
 
 
 class Scheduler:
@@ -474,4 +476,5 @@ class Scheduler:
             map_output_dirs=inputs,
             output_dir=out_dir,
             output_file=out_file,
+            use_combiner=job.spec.use_combiner,
         )

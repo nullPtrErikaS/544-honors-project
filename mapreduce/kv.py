@@ -53,15 +53,16 @@ def output_filename(p: int) -> str:
     return f"part-r-{p:05d}"
 
 
-def write_run(path: Path, records: Iterable[Record]) -> int:
-    """Write already-sorted records to ``path``; return bytes written."""
-    nbytes = 0
+def write_run(path: Path, records: Iterable[Record]) -> tuple[int, int]:
+    """Write already-sorted records to ``path``; return ``(records, bytes)`` written."""
+    nrecords = nbytes = 0
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         for k, v in records:
             line = f"{k}\t{v}\n"
             f.write(line)
+            nrecords += 1
             nbytes += len(line)  # encoded JSON is ASCII, so chars == bytes
-    return nbytes
+    return nrecords, nbytes
 
 
 def read_run(path: Path) -> Iterator[Record]:

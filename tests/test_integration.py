@@ -247,3 +247,23 @@ def test_backup_tasks_beat_a_straggler(tmp_path, monkeypatch):
     finally:
         cluster.close()
         print(cluster.dump_logs())
+
+
+def test_combiner_same_output_less_shuffle(cluster):
+    plain = cluster.run_job(
+        "wordcount.py", "inputs/corpus", "outputs/plain", maps=4, reduces=2, combiner=False
+    )
+    combined = cluster.run_job("wordcount.py", "inputs/corpus", "outputs/comb", maps=4, reduces=2)
+    assert plain.state == combined.state == mr_pb2.JOB_SUCCEEDED
+    assert (plain.use_combiner, combined.use_combiner) == (False, True)
+    assert sorted(cluster.output_lines("outputs/comb")) == sorted(
+        cluster.output_lines("outputs/plain")
+    )
+    assert combined.counters["intermediate_records"] <= 4 * 304  # <= one per word per map
+    assert plain.counters["intermediate_records"] == plain.counters["map_output_records"]
+    assert combined.counters["intermediate_bytes"] * 3 < plain.counters["intermediate_bytes"]
+
+
+def test_combiner_flag_ignored_for_jobs_without_one(cluster):
+    status = cluster.run_job("inverted_index.py", "inputs/corpus", "outputs/ii", maps=2, reduces=1)
+    assert status.state == mr_pb2.JOB_SUCCEEDED and not status.use_combiner

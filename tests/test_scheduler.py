@@ -343,3 +343,8 @@ def test_speculation_can_be_disabled_per_job(sched, clock):
     start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
     clock.advance(100)
     assert sched.try_assign("w1") is None
+
+
+def test_assignment_carries_combiner_flag(sched):
+    submit(sched, maps=1, reduces=1, use_combiner=True)
+    assert sched.try_assign("w1").use_combiner is True

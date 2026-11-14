@@ -50,13 +50,22 @@ def run_in_process(
     num_maps: int,
     num_reduces: int,
     spill_threshold: int = 500_000,
+    use_combiner: bool = False,
 ) -> list[str]:
     """Run a job with the real split/map/reduce code but no boss or workers."""
     splits = compute_splits(storage.list_input_files(root, input_rel), num_maps)
     map_dirs = []
     for m, segments in enumerate(splits):
         out = root / "_jobs" / "test" / f"map-{m}"
-        run_map_task(job, root, segments, num_reduces, out, spill_threshold=spill_threshold)
+        run_map_task(
+            job,
+            root,
+            segments,
+            num_reduces,
+            out,
+            spill_threshold=spill_threshold,
+            use_combiner=use_combiner,
+        )
         map_dirs.append(out)
     lines: list[str] = []
     for r in range(num_reduces):

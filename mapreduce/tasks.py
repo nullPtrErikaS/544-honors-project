@@ -3,20 +3,20 @@
 These functions only touch the filesystem; they know nothing about gRPC or the boss, so
 they can be unit-tested directly and reused by the worker.
 
-Map task:    input segments --mapper--> buffer --sort/spill--> R sorted partition files
+Map task:    input segments --mapper--> buffer --sort/spill(+combine)--> R sorted files
 Reduce task: partition r of every map's output --k-way merge--> reducer --> one output file
 """
 
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
 from mapreduce import kv
-from mapreduce.jobcode import JobFunctions, pairs
+from mapreduce.jobcode import Fn, JobFunctions, pairs
 from mapreduce.splits import Segment, read_segment
 
 DEFAULT_SPILL_THRESHOLD = 500_000  # buffered map output records before sorting to disk
@@ -46,6 +46,9 @@ class MapOutputBuffer:
     of encoded data are buffered, each partition is sorted and written as a *spill* run. At
     the end, spills are merged into one sorted file per partition, so memory use is bounded
     by the thresholds.
+
+    If a ``combiner`` is given, it is applied to each key's values every time sorted data
+    is written: at every spill, and again while merging spills into the final file.
     """
 
     def __init__(
@@ -55,12 +58,14 @@ class MapOutputBuffer:
         spill_threshold: int,
         counters: Counters,
         spill_bytes: int = DEFAULT_SPILL_BYTES,
+        combiner: Fn | None = None,
     ):
         self.num_partitions = num_partitions
         self.out_dir = out_dir
         self.spill_threshold = spill_threshold
         self.spill_bytes = spill_bytes
         self.counters = counters
+        self.combiner = combiner
         self.buffers: list[list[kv.Record]] = [[] for _ in range(num_partitions)]
         self.buffered = 0
         self.buffered_bytes = 0
@@ -79,7 +84,7 @@ class MapOutputBuffer:
         for p, records in enumerate(self.buffers):
             if records:
                 path = self.out_dir / f"spill-{self.num_spills:04d}-{p:05d}.kv"
-                kv.write_run(path, kv.sort_records(records))
+                kv.write_run(path, self._combined(kv.sort_records(records)))
                 self.spill_files[p].append(path)
         self.num_spills += 1
         self.buffers = [[] for _ in range(self.num_partitions)]
@@ -89,19 +94,46 @@ class MapOutputBuffer:
         """Write the final ``part-NNNNN.kv`` file for every partition (empty ones too)."""
         if self.num_spills and self.buffered:
             self._spill()
-        nbytes = 0
+        nrecords = nbytes = 0
         for p in range(self.num_partitions):
             final = self.out_dir / kv.partition_filename(p)
-            if not self.num_spills:
-                nbytes += kv.write_run(final, kv.sort_records(self.buffers[p]))
-                continue
             with ExitStack() as stack:
-                merged = kv.merge_runs(self.spill_files[p], stack, tmp_dir=self.out_dir)
-                nbytes += kv.write_run(final, merged)
+                if self.num_spills:
+                    records = kv.merge_runs(self.spill_files[p], stack, tmp_dir=self.out_dir)
+                else:
+                    records = kv.sort_records(self.buffers[p])
+                n, b = kv.write_run(final, self._combined(records))
+            nrecords, nbytes = nrecords + n, nbytes + b
             for path in self.spill_files[p]:
                 path.unlink()
         self.counters["spills"] = self.num_spills
+        self.counters["intermediate_records"] = nrecords
         self.counters["intermediate_bytes"] = nbytes
+
+    def _combined(self, records: Iterable[kv.Record]) -> Iterable[kv.Record]:
+        """Apply the combiner to sorted records (or pass them through if there is none)."""
+        if self.combiner is None:
+            return records
+        return self._combine(records, self.combiner)
+
+    def _combine(self, records: Iterable[kv.Record], combiner: Fn) -> Iterator[kv.Record]:
+        n_in = n_out = 0
+
+        def values(group: Iterator[kv.Record]) -> Iterator[Any]:
+            nonlocal n_in
+            for _, v in group:
+                n_in += 1
+                yield kv.decode(v)
+
+        for encoded_key, group in kv.group_by_key(records):
+            key = kv.decode(encoded_key)
+            for k, v in pairs(combiner(key, values(group)), "combiner"):
+                if k != key and kv.encode_key(k) != encoded_key:
+                    raise ValueError(f"combiner must not change the key: got {k!r} for {key!r}")
+                n_out += 1
+                yield encoded_key, kv.encode_value(v)
+        for name, n in (("combine_input_records", n_in), ("combine_output_records", n_out)):
+            self.counters[name] = self.counters.get(name, 0) + n
 
 
 def run_map_task(
@@ -111,6 +143,7 @@ def run_map_task(
     num_reduce: int,
     out_dir: Path,
     *,
+    use_combiner: bool = False,
     spill_threshold: int = DEFAULT_SPILL_THRESHOLD,
     spill_bytes: int = DEFAULT_SPILL_BYTES,
     cancel: threading.Event | None = None,
@@ -118,7 +151,10 @@ def run_map_task(
     """Run ``job.mapper`` over every line of ``segments``; write partitions to ``out_dir``."""
     out_dir.mkdir(parents=True, exist_ok=True)
     counters: Counters = {"map_input_records": 0, "map_output_records": 0}
-    buffer = MapOutputBuffer(num_reduce, out_dir, spill_threshold, counters, spill_bytes)
+    combiner = job.combiner if use_combiner else None
+    buffer = MapOutputBuffer(
+        num_reduce, out_dir, spill_threshold, counters, spill_bytes=spill_bytes, combiner=combiner
+    )
     n_in = n_out = 0
     for seg in segments:
         for line in read_segment(root, seg):
