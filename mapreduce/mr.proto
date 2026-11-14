@@ -25,6 +25,9 @@ service Coordinator {
   // Long poll: the boss holds the call for up to ~1 s if no task is available.
   rpc RequestTask(TaskRequest) returns (TaskAssignment);
   rpc ReportTask(TaskReport) returns (TaskReportReply);
+  // Sent every second by each worker. A worker that stays silent for 5 s is declared dead
+  // and its running attempts are rescheduled.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
 }
 
 enum JobState {
@@ -201,4 +204,13 @@ message TaskReport {
 
 message TaskReportReply {
   bool accepted = 1;            // false if the attempt was already written off
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated string running_attempts = 2;
+}
+
+message HeartbeatReply {
+  repeated string cancel_attempts = 1;  // stop these attempts; their results are unwanted
 }

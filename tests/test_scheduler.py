@@ -163,3 +163,91 @@ def test_attempt_timing_uses_clock(sched, clock):
     sched.report("w1", a.attempt_id, True)
     attempt = job.maps[0].attempts[0]
     assert attempt.end - attempt.start == 2.5
+
+
+# ------------------------------------------------------------------ worker failures
+
+
+def test_dead_worker_attempt_is_rescheduled(sched, clock):
+    job = submit(sched, maps=2, reduces=1)
+    a0 = sched.try_assign("w1")
+    sched.try_assign("w2")
+    sched.report("w1", a0.attempt_id, True)
+
+    clock.advance(sched.worker_timeout - 1)
+    sched.heartbeat("w1", [])
+    assert sched.check_workers() == []
+    clock.advance(2)  # w2 now silent for longer than the timeout; w1 is not
+    assert sched.check_workers() == ["w2"]
+
+    lost = job.maps[1].attempts[0]
+    assert lost.state is AttemptState.LOST and "w2 died" in lost.error
+    retry = sched.try_assign("w1")
+    assert (retry.task_index, retry.attempt_id) == (1, f"{job.id}-m0001-a1")
+    # Map 0 was committed by w1 and is not redone.
+    assert len(job.maps[0].attempts) == 1
+
+
+def test_committed_map_output_of_dead_worker_is_kept(sched, clock):
+    """Map output lives on shared storage, so it survives the worker (unlike the paper)."""
+    job = submit(sched, maps=2, reduces=1)
+    for w in ("w1", "w2"):
+        a = sched.try_assign(w)
+        sched.report(w, a.attempt_id, True)
+    assert job.state is JobState.REDUCING
+    r = sched.try_assign("w2")
+    clock.advance(sched.worker_timeout + 1)
+    sched.heartbeat("w1", [])
+    sched.check_workers()
+
+    assert job.state is JobState.REDUCING
+    assert all(len(t.attempts) == 1 and t.done for t in job.maps)
+    retry = sched.try_assign("w1")
+    assert retry.kind is TaskKind.REDUCE and retry.attempt_id != r.attempt_id
+    sched.report("w1", retry.attempt_id, True)
+    assert job.state is JobState.SUCCEEDED
+
+
+def test_lost_attempts_do_not_count_as_failures(sched, clock):
+    job = submit(sched, maps=1, reduces=1)
+    for i in range(sched.max_task_failures + 2):
+        sched.try_assign(f"w{i}")
+        clock.advance(sched.worker_timeout + 1)
+        sched.check_workers()
+    assert job.state is JobState.MAPPING
+    assert job.maps[0].failures == 0
+
+
+def test_returning_worker_is_told_to_cancel_and_its_report_is_ignored(sched, clock):
+    job = submit(sched, maps=1, reduces=1)
+    a = sched.try_assign("w1")
+    clock.advance(sched.worker_timeout + 1)
+    sched.check_workers()
+    assert not sched.workers["w1"].alive
+    retry = sched.try_assign("w2")
+
+    # w1 was only partitioned away. It comes back, still working on the old attempt.
+    assert sched.heartbeat("w1", [a.attempt_id]) == [a.attempt_id]
+    assert sched.workers["w1"].alive
+    assert sched.report("w1", a.attempt_id, True) is False
+    assert sched.report("w2", retry.attempt_id, True) is True
+    assert job.maps[0].committed.worker_id == "w2"
+
+
+def test_worker_asking_for_work_abandons_its_previous_attempt(sched):
+    """A restarted container reuses its hostname; don't wait for the timeout."""
+    job = submit(sched, maps=2, reduces=1)
+    old = sched.try_assign("w1")
+    new = sched.try_assign("w1")
+    assert job.maps[0].attempts[0].state is AttemptState.LOST
+    assert new.task_index == 0 and new.attempt_id != old.attempt_id
+
+
+def test_heartbeat_cancels_attempts_of_failed_job(sched):
+    job = submit(sched, maps=2, reduces=1)
+    sched.max_task_failures = 1
+    a0, a1 = sched.try_assign("w1"), sched.try_assign("w2")
+    sched.report("w1", a0.attempt_id, False, "boom")
+    assert job.state is JobState.FAILED
+    assert sched.heartbeat("w2", [a1.attempt_id]) == [a1.attempt_id]
+    assert sched.heartbeat("w2", []) == []

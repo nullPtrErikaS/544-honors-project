@@ -180,3 +180,45 @@ def test_cli_end_to_end(cluster, tmp_path):
     assert job_id in mr("jobs")
     assert "w1" in mr("workers")
     assert "part-r-00001" in mr("ls", "cli/out")
+
+
+SLOW_JOB = REPO / "tests" / "jobs" / "slow_wordcount.py"
+
+
+def slow_job_reference(cluster: LocalCluster, monkeypatch) -> list[str]:
+    monkeypatch.setenv("SLOW_FACTOR", "0")  # same results, without the sleeping
+    return run_local(jobcode.load_job(SLOW_JOB.read_text(), "slow"), cluster.root, "inputs/corpus")
+
+
+def wait_for_attempt(cluster: LocalCluster, job_id: str, worker_id: str) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        status = cluster.client.status(job_id)
+        if any(
+            a.worker_id == worker_id and a.state == mr_pb2.ATTEMPT_RUNNING for a in status.attempts
+        ):
+            return
+        time.sleep(0.02)
+    raise TimeoutError(f"{worker_id} never started an attempt")
+
+
+def test_job_survives_worker_crash(cluster, monkeypatch):
+    job_id = cluster.client.submit("inputs/corpus", "outputs/ft", SLOW_JOB, maps=8, reduces=3)
+    wait_for_attempt(cluster, job_id, "w2")
+    cluster.kill("w2")  # like `docker kill`: no goodbye, no report
+
+    status = cluster.client.wait(job_id, timeout=60)
+    assert status.state == mr_pb2.JOB_SUCCEEDED, status.error
+    lost = [a for a in status.attempts if a.state == mr_pb2.ATTEMPT_LOST]
+    assert lost and all(a.worker_id == "w2" for a in lost)
+    for a in lost:  # each lost task was redone elsewhere
+        assert any(
+            b.kind == a.kind
+            and b.task_index == a.task_index
+            and b.state == mr_pb2.ATTEMPT_SUCCEEDED
+            and b.worker_id != "w2"
+            for b in status.attempts
+        )
+    assert sorted(cluster.output_lines("outputs/ft")) == slow_job_reference(cluster, monkeypatch)
+    workers = {w.worker_id: w.alive for w in cluster.client.workers()}
+    assert workers == {"w1": True, "w2": False, "w3": True}
