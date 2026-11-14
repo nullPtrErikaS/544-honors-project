@@ -134,14 +134,16 @@ class BossService(mr_pb2_grpc.BossServicer):
         if overlaps(input_path, output_path):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "input and output paths overlap")
         with self.scheduler.lock:
+            # Don't let a new job delete or overwrite data that a running job reads or writes.
             busy = [
                 j.id
                 for j in self.scheduler.active_jobs()
                 if overlaps(j.spec.output_path, output_path)
+                or overlaps(j.spec.input_path, output_path)
             ]
         if busy:
             context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, f"{busy[0]} is writing to {output_path}"
+                grpc.StatusCode.FAILED_PRECONDITION, f"{busy[0]} is still using {output_path}"
             )
 
         try:

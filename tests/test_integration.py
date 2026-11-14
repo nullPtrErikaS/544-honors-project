@@ -267,3 +267,15 @@ def test_combiner_same_output_less_shuffle(cluster):
 def test_combiner_flag_ignored_for_jobs_without_one(cluster):
     status = cluster.run_job("inverted_index.py", "inputs/corpus", "outputs/ii", maps=2, reduces=1)
     assert status.state == mr_pb2.JOB_SUCCEEDED and not status.use_combiner
+
+
+def test_cannot_overwrite_data_a_running_job_uses(cluster):
+    assert cluster.run_job("wordcount.py", "inputs/corpus", "outputs/first", 2, 1).state == (
+        mr_pb2.JOB_SUCCEEDED
+    )
+    # A slow job reads outputs/first while another job tries to replace it.
+    reader = cluster.client.submit("outputs/first", "outputs/second", SLOW_JOB, 2, 1)
+    with pytest.raises(grpc.RpcError) as err:
+        cluster.run_job("wordcount.py", "inputs/corpus", "outputs/first", 2, 1, overwrite=True)
+    assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert cluster.client.wait(reader, timeout=60).state == mr_pb2.JOB_SUCCEEDED
