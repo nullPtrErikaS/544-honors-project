@@ -1,0 +1,41 @@
+# Boss + 4 workers sharing one volume. Each worker gets exactly 1 CPU, so using all four
+# CPUs of the VM requires spreading tasks across all four workers.
+name: mapreduce
+
+x-worker: &worker
+  build: .
+  image: mapreduce:latest
+  command: ["python", "-m", "mapreduce.worker"]
+  environment:
+    MR_BOSS: boss:5440
+  volumes:
+    - mrdata:/data
+  cpus: 1.0
+  depends_on:
+    - boss
+
+services:
+  boss:
+    build: .
+    image: mapreduce:latest
+    command: ["python", "-m", "mapreduce.boss"]
+    ports:
+      - "5440:5440"
+    volumes:
+      - mrdata:/data
+
+  worker1:
+    <<: *worker
+    hostname: worker1   # the worker id shown by `mr workers` and `mr status`
+  worker2:
+    <<: *worker
+    hostname: worker2
+  worker3:
+    <<: *worker
+    hostname: worker3
+  worker4:
+    <<: *worker
+    hostname: worker4
+
+volumes:
+  mrdata:

@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+mapreduce/mr_pb2*
+bench
+docs
+data
+scratch

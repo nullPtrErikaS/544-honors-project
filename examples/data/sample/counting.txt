@@ -1,0 +1,7 @@
+Counting words is the hello world of MapReduce.
+The map function splits a line into words and emits each word with the number one.
+The reduce function adds up the ones for each word.
+A combiner can add up the ones early, on the map side, before the shuffle.
+With a combiner the shuffle moves one pair per word per map task
+instead of one pair per occurrence, which is much less data.
+The word the appears a lot, so the combiner helps the word the a lot.
