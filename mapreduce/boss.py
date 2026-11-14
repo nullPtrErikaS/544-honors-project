@@ -73,6 +73,7 @@ def job_to_proto(job: Job, now: float, with_attempts: bool) -> mr_pb2.JobStatus:
         submitted_at=job.submitted_wall,
         elapsed=end - job.submitted,
         counters=dict(job.counters),
+        speculative_execution=job.spec.speculative,
         attempts=[attempt_to_proto(a) for a in job.all_attempts()] if with_attempts else [],
     )
 
@@ -165,6 +166,7 @@ class BossService(mr_pb2_grpc.BossServicer):
             filename=filename,
             num_maps=req.num_map_tasks,
             num_reduces=req.num_reduce_tasks,
+            speculative=req.speculative_execution,
         )
         return spec, compute_splits(files, req.num_map_tasks)
 

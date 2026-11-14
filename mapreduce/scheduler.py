@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import statistics
 import threading
 import time
 from collections import Counter
@@ -28,6 +29,8 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MAX_TASK_FAILURES = 4
 DEFAULT_WORKER_TIMEOUT = 5.0  # seconds of silence before a worker is declared dead
+DEFAULT_SPECULATION_FACTOR = 1.5  # straggler = running longer than 1.5x the median task
+DEFAULT_SPECULATION_MIN_RUNTIME = 1.0  # ...and longer than this many seconds
 RECHECK_INTERVAL = 0.25  # how often a waiting RequestTask re-evaluates time-based rules
 
 
@@ -69,6 +72,7 @@ class JobSpec:
     filename: str
     num_maps: int
     num_reduces: int
+    speculative: bool = True  # launch backup attempts for stragglers
 
 
 @dataclass(eq=False)
@@ -175,12 +179,16 @@ class Scheduler:
         wall_clock: Callable[[], float] = time.time,
         max_task_failures: int = DEFAULT_MAX_TASK_FAILURES,
         worker_timeout: float = DEFAULT_WORKER_TIMEOUT,
+        speculation_factor: float = DEFAULT_SPECULATION_FACTOR,
+        speculation_min_runtime: float = DEFAULT_SPECULATION_MIN_RUNTIME,
     ):
         self.committer = committer
         self.clock = clock
         self.wall_clock = wall_clock
         self.max_task_failures = max_task_failures
         self.worker_timeout = worker_timeout
+        self.speculation_factor = speculation_factor
+        self.speculation_min_runtime = speculation_min_runtime
         self.lock = threading.Condition()
         self.jobs: dict[str, Job] = {}
         self.workers: dict[str, Worker] = {}
@@ -308,11 +316,42 @@ class Scheduler:
     # ------------------------------------------------------------------ policy
 
     def _choose(self, worker_id: str) -> Attempt | None:
-        for job in self.active_jobs():
+        """Pick work for an idle worker: pending tasks first, then backups of stragglers."""
+        active = self.active_jobs()
+        for job in active:
             for task in job.phase_tasks():
                 if task.pending:
                     return self._launch(task, worker_id)
+        for job in active:
+            if job.spec.speculative and (straggler := self._straggler(job, worker_id)):
+                return self._launch(straggler, worker_id, speculative=True)
         return None
+
+    def _straggler(self, job: Job, worker_id: str) -> Task | None:
+        """The task in the job's current phase that most deserves a backup attempt, if any.
+
+        A task qualifies if it has exactly one running attempt, on another worker, and that
+        attempt has run for longer than ``speculation_factor`` x the median duration of the
+        phase's finished tasks (and at least ``speculation_min_runtime``). We need at least
+        one finished task to know what "normal" looks like.
+        """
+        tasks = job.phase_tasks()
+        durations = [t.committed.end - t.committed.start for t in tasks if t.committed]
+        if not durations:
+            return None
+        threshold = max(
+            self.speculation_min_runtime, self.speculation_factor * statistics.median(durations)
+        )
+        now = self.clock()
+        best, best_runtime = None, threshold
+        for task in tasks:
+            running = task.running
+            if task.done or len(running) != 1 or running[0].worker_id == worker_id:
+                continue
+            runtime = now - running[0].start
+            if runtime > best_runtime:
+                best, best_runtime = task, runtime
+        return best
 
     def _launch(self, task: Task, worker_id: str, speculative: bool = False) -> Attempt:
         job = task.job
@@ -343,6 +382,9 @@ class Scheduler:
         attempt.state = AttemptState.SUCCEEDED
         task.committed = attempt
         job.counters.update(counters)
+        for other in task.running:  # the losing copy of a speculated task
+            log.info("%s won; killing %s", attempt.id, other.id)
+            self._kill(other)
         self._advance(job)
         return True
 

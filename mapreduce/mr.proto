@@ -64,6 +64,7 @@ message SubmitJobRequest {
   int32 num_map_tasks = 5;
   int32 num_reduce_tasks = 6;
   bool overwrite_output = 7;    // replace output_path if it already exists
+  bool speculative_execution = 8;  // launch backup attempts for straggler tasks
 }
 
 message SubmitJobReply {
@@ -101,6 +102,7 @@ message JobStatus {
   double elapsed = 12;          // seconds from submission to completion (or now)
   map<string, int64> counters = 13;
   repeated AttemptInfo attempts = 14;  // only filled in by GetJob
+  bool speculative_execution = 15;
 }
 
 message ListJobsRequest {}

@@ -108,6 +108,7 @@ class Client:
         reduces: int,
         *,
         overwrite: bool = False,
+        speculation: bool = True,
     ) -> str:
         source = job_file.read_text(encoding="utf-8")
         jobcode.top_level_names(source, job_file.name)  # fail fast on obvious mistakes
@@ -119,6 +120,7 @@ class Client:
             num_map_tasks=maps,
             num_reduce_tasks=reduces,
             overwrite_output=overwrite,
+            speculative_execution=speculation,
         )
         return self.stub.SubmitJob(request).job_id
 
@@ -187,6 +189,14 @@ def print_status(s: mr_pb2.JobStatus, attempts: bool = True) -> None:
     print(f"  output:   {s.output_path}")
     print(f"  maps:     {s.maps_done}/{s.num_map_tasks}")
     print(f"  reduces:  {s.reduces_done}/{s.num_reduce_tasks}")
+    print(f"  options:  speculation {'on' if s.speculative_execution else 'off'}")
+    backups = [a for a in s.attempts if a.speculative]
+    if backups:
+        won = sum(a.state == mr_pb2.ATTEMPT_SUCCEEDED for a in backups)
+        print(f"  backups:  {len(backups)} launched, {won} finished first")
+    lost = sum(a.state == mr_pb2.ATTEMPT_LOST for a in s.attempts)
+    if lost:
+        print(f"  lost:     {lost} attempt(s) on dead workers were re-executed")
     if s.error:
         print("  error:\n    " + s.error.replace("\n", "\n    "))
     if s.counters:
@@ -243,6 +253,7 @@ def cmd_submit(client: Client, args) -> int:
         args.maps,
         args.reduces,
         overwrite=args.overwrite,
+        speculation=not args.no_speculation,
     )
     if args.detach:
         print(job_id)
@@ -362,6 +373,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--maps", type=int, required=True, help="number of map tasks")
     p.add_argument("--reduces", type=int, required=True, help="number of reduce tasks")
     p.add_argument("--overwrite", action="store_true", help="replace the output if it exists")
+    p.add_argument(
+        "--no-speculation", action="store_true", help="never launch backup tasks for stragglers"
+    )
     p.add_argument("--detach", action="store_true", help="print the job id and exit")
     p.set_defaults(func=cmd_submit)
 

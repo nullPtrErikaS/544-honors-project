@@ -251,3 +251,95 @@ def test_heartbeat_cancels_attempts_of_failed_job(sched):
     assert job.state is JobState.FAILED
     assert sched.heartbeat("w2", [a1.attempt_id]) == [a1.attempt_id]
     assert sched.heartbeat("w2", []) == []
+
+
+# ------------------------------------------------------------------ speculative execution
+
+
+def start_wave(sched, clock, job, workers, finish, duration=2.0):
+    """Assign one task to each worker, then let the workers in ``finish`` complete."""
+    attempts = {w: sched.try_assign(w) for w in workers}
+    clock.advance(duration)
+    for w in finish:
+        sched.report(w, attempts[w].attempt_id, True)
+    return attempts
+
+
+def test_no_backup_until_a_task_has_finished(sched, clock):
+    submit(sched, maps=2, reduces=1)
+    sched.try_assign("w1")
+    sched.try_assign("w2")
+    clock.advance(100)
+    assert sched.try_assign("w3") is None
+
+
+def test_backup_launched_for_straggler(sched, clock):
+    job = submit(sched, maps=3, reduces=1)
+    start_wave(sched, clock, job, ["w1", "w2", "w3"], finish=["w1", "w2"], duration=2.0)
+    # Median finished duration is 2 s, so the threshold is 3 s; w3 has run 2 s.
+    assert sched.try_assign("w1") is None
+    clock.advance(1.5)
+    backup = sched.try_assign("w1")
+    assert backup.task_index == 2 and backup.attempt_id.endswith("-a1")
+    assert job.maps[2].attempts[1].speculative
+    # Only one backup per task.
+    assert sched.try_assign("w2") is None
+
+
+def test_straggler_never_backs_itself_up(sched, clock):
+    job = submit(sched, maps=2, reduces=1)
+    start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
+    clock.advance(10)
+    # w2 is busy with the straggler, but even if it asked, it must not get its own task.
+    assert sched._straggler(job, "w2") is None
+    assert sched._straggler(job, "w1") is job.maps[1]
+
+
+def test_backup_wins_and_original_is_cancelled(sched, clock):
+    job = submit(sched, maps=2, reduces=1)
+    first = start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
+    clock.advance(5)
+    backup = sched.try_assign("w1")
+    clock.advance(2)
+    assert sched.report("w1", backup.attempt_id, True) is True
+
+    original = job.maps[1].attempts[0]
+    assert original.state is AttemptState.KILLED
+    assert job.maps[1].committed.id == backup.attempt_id
+    assert sched.heartbeat("w2", [first["w2"].attempt_id]) == [first["w2"].attempt_id]
+    assert sched.report("w2", first["w2"].attempt_id, True) is False
+    assert job.state is JobState.REDUCING
+
+
+def test_original_wins_and_backup_is_cancelled(sched, clock):
+    job = submit(sched, maps=2, reduces=1)
+    first = start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
+    clock.advance(5)
+    backup = sched.try_assign("w1")
+    sched.report("w2", first["w2"].attempt_id, True)
+    assert job.maps[1].attempts[1].state is AttemptState.KILLED
+    assert sched.heartbeat("w1", [backup.attempt_id]) == [backup.attempt_id]
+
+
+def test_speculation_applies_to_reduce_phase(sched, clock):
+    job = submit(sched, maps=1, reduces=2)
+    run = sched.try_assign("w1")
+    sched.report("w1", run.attempt_id, True)
+    start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
+    clock.advance(5)
+    backup = sched.try_assign("w1")
+    assert backup.kind is TaskKind.REDUCE and backup.task_index == 1
+
+
+def test_short_tasks_are_not_speculated(sched, clock):
+    job = submit(sched, maps=2, reduces=1)
+    start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"], duration=0.1)
+    clock.advance(0.5)  # 6x the median, but below the 1 s minimum
+    assert sched.try_assign("w1") is None
+
+
+def test_speculation_can_be_disabled_per_job(sched, clock):
+    job = submit(sched, maps=2, reduces=1, speculative=False)
+    start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"])
+    clock.advance(100)
+    assert sched.try_assign("w1") is None
