@@ -222,3 +222,28 @@ def test_job_survives_worker_crash(cluster, monkeypatch):
     assert sorted(cluster.output_lines("outputs/ft")) == slow_job_reference(cluster, monkeypatch)
     workers = {w.worker_id: w.alive for w in cluster.client.workers()}
     assert workers == {"w1": True, "w2": False, "w3": True}
+
+
+def test_backup_tasks_beat_a_straggler(tmp_path, monkeypatch):
+    cluster = LocalCluster(tmp_path, num_workers=2)
+    try:
+        cluster.start_worker("slow", env={"SLOW_FACTOR": "25"})
+        cluster.wait_for_workers(3)
+        make_corpus(tmp_path / "src")
+        cluster.client.upload(tmp_path / "src", "inputs/corpus")
+
+        status = cluster.run_job(SLOW_JOB, "inputs/corpus", "outputs/spec", maps=6, reduces=2)
+        assert status.state == mr_pb2.JOB_SUCCEEDED, status.error
+        backups = [a for a in status.attempts if a.speculative]
+        assert backups, "no backup attempts were launched"
+        assert any(a.state == mr_pb2.ATTEMPT_SUCCEEDED for a in backups)
+        # Whatever the slow worker was still running when its backup won got cancelled.
+        assert any(
+            a.worker_id == "slow" and a.state == mr_pb2.ATTEMPT_KILLED for a in status.attempts
+        )
+        assert sorted(cluster.output_lines("outputs/spec")) == slow_job_reference(
+            cluster, monkeypatch
+        )
+    finally:
+        cluster.close()
+        print(cluster.dump_logs())
