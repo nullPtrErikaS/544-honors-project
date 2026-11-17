@@ -385,7 +385,8 @@ ruff check . && ruff format --check .
 | File | What it covers |
 |---|---|
 | `tests/test_splits.py` | Input splitting. Includes a property test: over 300 random files and split counts (empty lines, CRLF, no trailing newline, multi-byte UTF-8), every line is read by exactly one split |
-| `tests/test_kv.py` | Partitioner is stable across processes (different `PYTHONHASHSEED`), sorted-run merge, output format |
+| `tests/test_storage.py` | Storage paths: every spelling of a path (`/x`, `//x`, `\x`, `./x`) normalizes to one form, `..` is rejected, hidden files are skipped |
+| `tests/test_kv.py` | Partitioner is stable across processes (different `PYTHONHASHSEED`), sorted-run merge (also in bounded fan-in passes), output format and escaping |
 | `tests/test_jobcode.py` | Job file validation without executing it, loading, tracebacks show user source lines |
 | `tests/test_tasks.py` | Map and reduce tasks against the sequential oracle for various M/R and spill thresholds; combiner correctness and data reduction; cancellation |
 | `tests/test_scheduler.py` | Scheduler state machine with a fake clock: phases, FIFO priority (including backups), retries and failure limit, lost-attempt limit, dead workers, rejoining workers, speculation thresholds and winners |
@@ -394,9 +395,13 @@ ruff check . && ruff format --check .
 
 GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull
 request:
-1. lint and all of the tests above, and
-2. an end-to-end job that builds the images, starts the real Compose cluster, and runs
+1. lint and all of the tests above on Python 3.13 (**Lint and test**),
+2. the same tests on Python 3.11, the oldest version the client supports, and
+3. an end-to-end job that builds the images, starts the real Compose cluster, and runs
    `scripts/smoke_test.sh` (upload, word count, diff against `mr local`).
+
+`main` is protected: a pull request can only merge when **Lint and test** and the Docker
+end-to-end job pass, and nobody can push to `main` directly.
 
 ---
 
