@@ -27,9 +27,13 @@ class FakeClock:
 
 class FakeCommitter:
     def __init__(self) -> None:
+        self.started: list[str] = []
         self.committed: list[tuple[str, int]] = []
         self.finished: list[tuple[str, bool]] = []
         self.fail_commits = False
+
+    def start_job(self, job_id: str, output: str) -> None:
+        self.started.append(job_id)
 
     def commit_reduce(self, output: str, attempt_id: str, partition: int) -> None:
         if self.fail_commits:
@@ -95,6 +99,7 @@ def test_maps_then_reduces(sched, committer):
     assert r.output_file == f"out/_temporary/{r.attempt_id}/part-r-00000"
     sched.report("w1", r.attempt_id, True)
     assert job.state is JobState.SUCCEEDED
+    assert committer.started == [job.id]
     assert committer.committed == [(r.attempt_id, 0)]
     assert committer.finished == [(job.id, True)]
 

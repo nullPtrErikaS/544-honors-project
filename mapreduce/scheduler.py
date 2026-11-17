@@ -61,6 +61,7 @@ class AttemptState(enum.Enum):
 
 
 class Committer(Protocol):
+    def start_job(self, job_id: str, output: str) -> None: ...
     def commit_reduce(self, output: str, attempt_id: str, partition: int) -> None: ...
     def finish_job(self, job_id: str, output: str, succeeded: bool) -> None: ...
 
@@ -209,6 +210,8 @@ class Scheduler:
             job = Job(f"job-{self._job_seq:04d}", spec, self.clock(), self.wall_clock())
             job.maps = [Task(job, TaskKind.MAP, i, segments=s) for i, s in enumerate(splits)]
             job.reduces = [Task(job, TaskKind.REDUCE, r) for r in range(spec.num_reduces)]
+            # Before any task is handed out: attempts can't create these parents themselves.
+            self.committer.start_job(job.id, spec.output_path)
             self.jobs[job.id] = job
             log.info(
                 "%s submitted: %s, %d maps, %d reduces",
