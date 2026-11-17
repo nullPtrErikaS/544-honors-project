@@ -1,0 +1,7 @@
+Docker packages a program together with everything it needs to run.
+A container is a running instance of an image, isolated from other containers.
+Docker Compose starts several containers from one file and wires them together.
+In this project one container runs the boss and four containers run workers.
+Each worker container may use at most one CPU, so the work must be spread out.
+All containers mount the same volume, which acts as shared storage for the job.
+The client runs outside the containers and talks to the boss over the network.

@@ -296,13 +296,33 @@ def cmd_workers(client: Client, args) -> None:
         )
 
 
+def cmd_wait_ready(client: Client, args) -> int:
+    """Block until the boss is up and enough workers have checked in (for scripts and CI)."""
+    deadline = time.monotonic() + args.timeout
+    alive = 0
+    while time.monotonic() < deadline:
+        try:
+            alive = sum(w.alive for w in client.workers())
+            if alive >= args.workers:
+                print(f"cluster ready: {alive} worker(s)")
+                return 0
+        except grpc.RpcError as e:
+            if e.code() != grpc.StatusCode.UNAVAILABLE:
+                raise
+        time.sleep(0.5)
+    print(f"error: only {alive} of {args.workers} workers after {args.timeout}s", file=sys.stderr)
+    return 1
+
+
 def cmd_local(args) -> None:
     source = Path(args.job).read_text(encoding="utf-8")
     job = jobcode.load_job(source, args.job)
     path = Path(args.input).resolve()
     cwd = Path.cwd().resolve()
     root = cwd if path.is_relative_to(cwd) else path.parent
-    sys.stdout.writelines(run_local(job, root, path.relative_to(root).as_posix()))
+    lines = run_local(job, root, path.relative_to(root).as_posix())
+    sys.stdout.buffer.write("".join(lines).encode("utf-8"))  # same bytes as `mr cat`
+    sys.stdout.buffer.flush()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -355,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("workers", help="list workers and what they are running")
     p.set_defaults(func=cmd_workers)
+
+    p = sub.add_parser("wait-ready", help="wait until the boss and N workers are up")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--timeout", type=float, default=60)
+    p.set_defaults(func=cmd_wait_ready)
 
     p = sub.add_parser("local", help="run a job sequentially on local files (for testing)")
     p.add_argument("--job", required=True)

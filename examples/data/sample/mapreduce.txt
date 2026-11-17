@@ -1,0 +1,10 @@
+MapReduce is a way to process a large data set on many machines at once.
+A user writes two small functions, map and reduce, and the system does the rest.
+The map function reads one record at a time and emits key value pairs.
+The reduce function sees every value for one key and combines them into a result.
+Between the two phases the system groups all pairs that share a key.
+That grouping step is called the shuffle, and it moves data between workers.
+The boss splits the input into pieces and hands each piece to a worker.
+If a worker dies, the boss notices and gives its work to another worker.
+If a worker is slow, the boss can start a backup copy of its task elsewhere.
+Whichever copy finishes first wins, and the other copy is thrown away.
