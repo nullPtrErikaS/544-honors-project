@@ -400,8 +400,8 @@ request:
 3. an end-to-end job that builds the images, starts the real Compose cluster, and runs
    `scripts/smoke_test.sh` (upload, word count, diff against `mr local`).
 
-`main` is protected: a pull request can only merge when **Lint and test** and the Docker
-end-to-end job pass, and nobody can push to `main` directly.
+`main` is protected: every change goes through a pull request, which can only merge when
+all three jobs pass. Nobody can push or force-push to `main` directly, admins included.
 
 ---
 

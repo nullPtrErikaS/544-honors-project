@@ -386,12 +386,13 @@ The boss records the start/end time, worker, and outcome of every attempt, and `
 
 ## 11. Engineering process
 
-- `main` is protected by a GitHub branch protection rule: a pull request can only merge
-  when **Lint and test** and the Docker end-to-end job pass, and `main` can't be pushed to
-  directly or force-pushed. All work lands through small pull requests from feature
-  branches, roughly one per row: design → data path → CI → boss/worker/client → Docker →
-  fault tolerance → speculation → combiner → benchmarks → docs.
+- `main` is protected by a GitHub branch protection rule: every change has to come through
+  a pull request, which can only merge when **Lint and test**, **Tests on Python 3.11**,
+  and the Docker end-to-end job pass. Nobody can push or force-push to `main` directly,
+  admins included. All work lands through small pull requests from feature branches,
+  roughly one per row: design → data path → CI → boss/worker/client → Docker → fault
+  tolerance → speculation → combiner → benchmarks → docs.
 - GitHub Actions runs lint (`ruff`), unit tests, integration tests, and the Docker
   end-to-end test on every PR.
-- Solo project: an AI agent reviews pull requests and leaves comments on the PR, and we
+- Solo project: an AI agent reviews pull requests and leaves comments on the PR, and I
   respond to and address the comments.
