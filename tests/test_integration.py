@@ -279,3 +279,26 @@ def test_cannot_overwrite_data_a_running_job_uses(cluster):
         cluster.run_job("wordcount.py", "inputs/corpus", "outputs/first", 2, 1, overwrite=True)
     assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert cluster.client.wait(reader, timeout=60).state == mr_pb2.JOB_SUCCEEDED
+
+
+def test_cannot_delete_or_upload_into_data_a_running_job_uses(cluster, tmp_path):
+    job_id = cluster.client.submit("inputs/corpus", "outputs/busy", SLOW_JOB, 2, 1)
+    (tmp_path / "new.txt").write_text("replacement\n")
+    refused = [
+        lambda: cluster.client.rm("inputs/corpus/part0.txt"),
+        lambda: cluster.client.rm("inputs"),
+        lambda: cluster.client.rm("outputs/busy"),
+        lambda: cluster.client.upload(tmp_path / "new.txt", "inputs/corpus/part0.txt"),
+        # A job must not read output that is still being written.
+        lambda: cluster.client.submit("outputs/busy", "outputs/next", JOBS / "wordcount.py", 1, 1),
+    ]
+    for action in refused:
+        with pytest.raises(grpc.RpcError) as err:
+            action()
+        assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert job_id in err.value.details()
+
+    # Unrelated paths are fine, and the running job is unaffected.
+    cluster.client.upload(tmp_path / "new.txt", "inputs/other/new.txt")
+    assert cluster.client.wait(job_id, timeout=60).state == mr_pb2.JOB_SUCCEEDED
+    cluster.client.rm("inputs/corpus/part0.txt")  # allowed once the job is done

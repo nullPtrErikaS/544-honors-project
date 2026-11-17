@@ -133,17 +133,19 @@ class BossService(mr_pb2_grpc.BossServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"invalid output path {output_path!r}")
         if overlaps(input_path, output_path):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "input and output paths overlap")
+        # Don't let a new job delete or overwrite data that a running job reads or writes,
+        # or read output that a running job hasn't finished writing.
+        self._check_not_in_use(output_path, context)
         with self.scheduler.lock:
-            # Don't let a new job delete or overwrite data that a running job reads or writes.
-            busy = [
+            writers = [
                 j.id
                 for j in self.scheduler.active_jobs()
-                if overlaps(j.spec.output_path, output_path)
-                or overlaps(j.spec.input_path, output_path)
+                if overlaps(j.spec.output_path, input_path)
             ]
-        if busy:
+        if writers:
             context.abort(
-                grpc.StatusCode.FAILED_PRECONDITION, f"{busy[0]} is still using {output_path}"
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"{writers[0]} is still writing {input_path}; wait for it to finish",
             )
 
         try:
@@ -203,6 +205,20 @@ class BossService(mr_pb2_grpc.BossServicer):
             ]
         return mr_pb2.ListWorkersReply(workers=workers)
 
+    def _check_not_in_use(self, path: str, context) -> None:
+        """Abort unless no queued or running job reads or writes storage path ``path``."""
+        with self.scheduler.lock:
+            users = [
+                j.id
+                for j in self.scheduler.active_jobs()
+                if overlaps(j.spec.input_path, path) or overlaps(j.spec.output_path, path)
+            ]
+        if users:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"{users[0]} is still using {path or '/'}; wait for it to finish",
+            )
+
     # --- storage
 
     def _path(self, rel: str, context, *, writable: bool = False) -> Path:
@@ -210,8 +226,10 @@ class BossService(mr_pb2_grpc.BossServicer):
             norm = storage.normalize(rel)
         except storage.StorageError as e:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
-        if writable and (not norm or norm.split("/")[0] == jobfiles.JOBS_DIR):
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"cannot write to {norm or '/'!r}")
+        if writable:
+            if not norm or norm.split("/")[0] == jobfiles.JOBS_DIR:
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"cannot write to {norm or '/'!r}")
+            self._check_not_in_use(norm, context)
         return storage.resolve(self.root, norm)
 
     def Upload(self, request_iterator, context):
@@ -270,10 +288,13 @@ class BossService(mr_pb2_grpc.BossServicer):
         return mr_pb2.ListFilesReply(files=infos)
 
     def DeletePath(self, request, context):
-        path = self._path(request.path, context, writable=True)
-        if not path.exists():
-            context.abort(grpc.StatusCode.NOT_FOUND, f"no such file or directory: {request.path}")
-        _remove(path)
+        with self._submit_lock:  # no job may be submitted on this path while we delete it
+            path = self._path(request.path, context, writable=True)
+            if not path.exists():
+                context.abort(
+                    grpc.StatusCode.NOT_FOUND, f"no such file or directory: {request.path}"
+                )
+            _remove(path)
         return mr_pb2.DeletePathReply()
 
 
