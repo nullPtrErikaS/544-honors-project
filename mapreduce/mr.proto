@@ -65,6 +65,7 @@ message SubmitJobRequest {
   int32 num_reduce_tasks = 6;
   bool overwrite_output = 7;    // replace output_path if it already exists
   bool speculative_execution = 8;  // launch backup attempts for straggler tasks
+  bool use_combiner = 9;        // apply the job's combiner (if it defines one) on map output
 }
 
 message SubmitJobReply {
@@ -103,6 +104,7 @@ message JobStatus {
   map<string, int64> counters = 13;
   repeated AttemptInfo attempts = 14;  // only filled in by GetJob
   bool speculative_execution = 15;
+  bool use_combiner = 16;
 }
 
 message ListJobsRequest {}
@@ -194,6 +196,7 @@ message TaskAssignment {
 
   string output_dir = 11;       // MAP only
   string output_file = 12;      // REDUCE only
+  bool use_combiner = 13;       // MAP only
 }
 
 message TaskReport {

@@ -74,6 +74,7 @@ def job_to_proto(job: Job, now: float, with_attempts: bool) -> mr_pb2.JobStatus:
         elapsed=end - job.submitted,
         counters=dict(job.counters),
         speculative_execution=job.spec.speculative,
+        use_combiner=job.spec.use_combiner,
         attempts=[attempt_to_proto(a) for a in job.all_attempts()] if with_attempts else [],
     )
 
@@ -92,6 +93,7 @@ def assignment_to_proto(a: Assignment) -> mr_pb2.TaskAssignment:
         map_output_dirs=a.map_output_dirs,
         output_dir=a.output_dir,
         output_file=a.output_file,
+        use_combiner=a.use_combiner,
     )
 
 
@@ -120,7 +122,7 @@ class BossService(mr_pb2_grpc.BossServicer):
     def _validate(self, req, context):
         filename = req.job_filename or "job.py"
         try:
-            jobcode.top_level_names(req.job_source, filename)
+            names = jobcode.top_level_names(req.job_source, filename)
             input_path = storage.normalize(req.input_path)
             output_path = storage.normalize(req.output_path)
         except (jobcode.JobCodeError, storage.StorageError) as e:
@@ -167,6 +169,7 @@ class BossService(mr_pb2_grpc.BossServicer):
             num_maps=req.num_map_tasks,
             num_reduces=req.num_reduce_tasks,
             speculative=req.speculative_execution,
+            use_combiner=req.use_combiner and "combiner" in names,
         )
         return spec, compute_splits(files, req.num_map_tasks)
 

@@ -19,3 +19,8 @@ def mapper(key, value):
 def reducer(key, values):
     """values: every count emitted for this word."""
     yield key, sum(values)
+
+
+# Optional: pre-aggregate counts on the map side before the shuffle. A combiner has the
+# reducer's signature and must keep the key. Summing is associative, so the reducer works.
+combiner = reducer

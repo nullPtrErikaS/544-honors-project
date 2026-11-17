@@ -54,9 +54,9 @@ def test_encoded_records_never_contain_separators():
 def test_run_round_trip_and_merge(tmp_path):
     run1 = kv.sort_records([(kv.encode_key(k), kv.encode_value(i)) for i, k in enumerate("dbca")])
     run2 = kv.sort_records([(kv.encode_key(k), kv.encode_value(i)) for i, k in enumerate("bze")])
-    nbytes = kv.write_run(tmp_path / "1", run1)
+    nrecords, nbytes = kv.write_run(tmp_path / "1", run1)
     kv.write_run(tmp_path / "2", run2)
-    assert nbytes == (tmp_path / "1").stat().st_size
+    assert (nrecords, nbytes) == (4, (tmp_path / "1").stat().st_size)
     assert list(kv.read_run(tmp_path / "1")) == run1
 
     with ExitStack() as stack:

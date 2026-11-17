@@ -127,3 +127,55 @@ def test_spills_on_buffered_bytes(sample_root):
         name = kv.partition_filename(p)
         spilled, unspilled = sample_root / "b" / name, sample_root / "r" / name
         assert list(kv.read_run(spilled)) == list(kv.read_run(unspilled))
+
+
+@pytest.mark.parametrize("spill", [500_000, 3])
+def test_combiner_preserves_results(sample_root, spill):
+    job = load_example("wordcount.py")
+    assert job.combiner is not None
+    got = run_in_process(job, sample_root, "inputs/sample", 2, 2, spill, use_combiner=True)
+    assert sorted(got) == run_local(job, sample_root, "inputs/sample")
+
+
+def test_combiner_shrinks_map_output(sample_root):
+    job = load_example("wordcount.py")
+    segments = [
+        s
+        for split in compute_splits(storage.list_input_files(sample_root, "inputs"), 1)
+        for s in split
+    ]
+    plain = run_map_task(job, sample_root, segments, 2, sample_root / "plain")
+    combined = run_map_task(
+        job, sample_root, segments, 2, sample_root / "comb", use_combiner=True, spill_threshold=4
+    )
+    assert plain["intermediate_records"] == plain["map_output_records"] == 25
+    # One record per distinct word once combined (the sample has 17 distinct words).
+    assert combined["intermediate_records"] == 17
+    assert combined["intermediate_bytes"] < plain["intermediate_bytes"]
+    assert combined["spills"] > 1
+    # Combined at every spill and again in the final merge.
+    assert combined["combine_input_records"] > combined["map_output_records"]
+
+    counts = {}
+    for p in range(2):
+        for k, v in kv.read_run(sample_root / "comb" / kv.partition_filename(p)):
+            assert k not in counts
+            counts[kv.decode(k)] = kv.decode(v)
+    assert counts["fox"] == 5 and counts["the"] == 4
+
+
+def test_combiner_must_keep_the_key(sample_root):
+    job = load_job(
+        "def mapper(k, v):\n    yield v, 1\n"
+        "def reducer(k, vs):\n    yield k, sum(vs)\n"
+        "def combiner(k, vs):\n    yield k + '!', sum(vs)\n"
+    )
+    with pytest.raises(ValueError, match="must not change the key"):
+        run_map_task(
+            job,
+            sample_root,
+            [Segment("inputs/sample/a.txt", 0, 10)],
+            1,
+            sample_root / "m",
+            use_combiner=True,
+        )
