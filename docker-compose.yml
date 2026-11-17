@@ -5,6 +5,7 @@ name: mapreduce
 x-worker: &worker
   build: .
   image: mapreduce:latest
+  init: true          # forward SIGTERM so `docker compose stop` is instant
   command: ["python", "-m", "mapreduce.worker"]
   environment:
     MR_BOSS: boss:5440
@@ -18,6 +19,7 @@ services:
   boss:
     build: .
     image: mapreduce:latest
+    init: true
     command: ["python", "-m", "mapreduce.boss"]
     ports:
       - "5440:5440"
