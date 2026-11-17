@@ -22,7 +22,9 @@ services:
     init: true
     command: ["python", "-m", "mapreduce.boss"]
     ports:
-      - "5440:5440"
+      # Loopback only: the boss has no authentication and runs any job code it is sent.
+      # From another machine, use an SSH tunnel (ssh -L 5440:localhost:5440 vm).
+      - "127.0.0.1:5440:5440"
     volumes:
       - mrdata:/data
 
