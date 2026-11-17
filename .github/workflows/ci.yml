@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: CI only needs to read the repository.
+permissions:
+  contents: read
+
+# A new push to a PR branch cancels that branch's runs still in progress. Every run on main
+# is kept.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    # "Lint and test" is the required check on main. The 3.11 run keeps the
+    # requires-python = ">=3.11" promise honest (the Docker image uses 3.13).
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Lint and test, python: "3.13", lint: true }
+          - { name: Tests on Python 3.11, python: "3.11", lint: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        if: ${{ matrix.lint }}
+        run: ruff check --output-format=github .
+      - name: Check formatting
+        if: ${{ matrix.lint && !cancelled() }}  # report formatting even when lint failed
+        run: ruff format --check .
+      - name: Unit and integration tests
+        run: pytest -v
