@@ -74,6 +74,8 @@ class Client:
                     if f is not None:
                         f.close()
                     current = chunk.path
+                    if chunk.path.startswith("/") or ".." in chunk.path.split("/"):
+                        raise ValueError(f"refusing to write outside {local}: {chunk.path!r}")
                     dest = local / chunk.path if chunk.path else local
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     f = open(dest, "wb")  # noqa: SIM115 -- closed in finally / on next file

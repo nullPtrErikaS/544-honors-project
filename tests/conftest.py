@@ -54,6 +54,9 @@ def run_in_process(
 ) -> list[str]:
     """Run a job with the real split/map/reduce code but no boss or workers."""
     splits = compute_splits(storage.list_input_files(root, input_rel), num_maps)
+    # Like the boss, create the parents; tasks only create their own output directory.
+    (root / "_jobs" / "test").mkdir(parents=True, exist_ok=True)
+    (root / "out").mkdir(exist_ok=True)
     map_dirs = []
     for m, segments in enumerate(splits):
         out = root / "_jobs" / "test" / f"map-{m}"

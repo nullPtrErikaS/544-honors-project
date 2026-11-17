@@ -95,6 +95,32 @@ def test_user_exception_fails_job_with_traceback(cluster, tmp_path):
     assert "KeyError" in status.error and "bad.py" in status.error
     failed = [a for a in status.attempts if a.state == mr_pb2.ATTEMPT_FAILED]
     assert len(failed) >= 4  # retried before giving up
+    assert not (cluster.root / "outputs" / "bad").exists()
+
+
+def test_failed_job_leaves_no_partial_output(cluster, tmp_path):
+    """Some reduce partitions commit before another one fails; none of it may remain."""
+    bad = tmp_path / "bad_reduce.py"
+    bad.write_text(
+        "def mapper(k, v):\n"
+        "    for w in v.split():\n"
+        "        yield w, 1\n"
+        "\n"
+        "def reducer(k, vs):\n"
+        "    if k == 'w0':\n"
+        "        raise ValueError(k)\n"
+        "    yield k, sum(vs)\n"
+    )
+    status = cluster.run_job(bad, "inputs/corpus", "outputs/partial", maps=2, reduces=4)
+    assert status.state == mr_pb2.JOB_FAILED and "ValueError" in status.error
+    committed = [
+        a
+        for a in status.attempts
+        if a.kind == mr_pb2.REDUCE and a.state == mr_pb2.ATTEMPT_SUCCEEDED
+    ]
+    assert committed, "expected some reduce partitions to commit before the job failed"
+    assert not (cluster.root / "outputs" / "partial").exists()
+    assert not (cluster.root / "_jobs" / status.job_id).exists()
 
 
 def test_invalid_jobs_are_rejected_at_submit(cluster, tmp_path):
@@ -267,3 +293,38 @@ def test_combiner_same_output_less_shuffle(cluster):
 def test_combiner_flag_ignored_for_jobs_without_one(cluster):
     status = cluster.run_job("inverted_index.py", "inputs/corpus", "outputs/ii", maps=2, reduces=1)
     assert status.state == mr_pb2.JOB_SUCCEEDED and not status.use_combiner
+
+
+def test_cannot_overwrite_data_a_running_job_uses(cluster):
+    assert cluster.run_job("wordcount.py", "inputs/corpus", "outputs/first", 2, 1).state == (
+        mr_pb2.JOB_SUCCEEDED
+    )
+    # A slow job reads outputs/first while another job tries to replace it.
+    reader = cluster.client.submit("outputs/first", "outputs/second", SLOW_JOB, 2, 1)
+    with pytest.raises(grpc.RpcError) as err:
+        cluster.run_job("wordcount.py", "inputs/corpus", "outputs/first", 2, 1, overwrite=True)
+    assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert cluster.client.wait(reader, timeout=60).state == mr_pb2.JOB_SUCCEEDED
+
+
+def test_cannot_delete_or_upload_into_data_a_running_job_uses(cluster, tmp_path):
+    job_id = cluster.client.submit("inputs/corpus", "outputs/busy", SLOW_JOB, 2, 1)
+    (tmp_path / "new.txt").write_text("replacement\n")
+    refused = [
+        lambda: cluster.client.rm("inputs/corpus/part0.txt"),
+        lambda: cluster.client.rm("inputs"),
+        lambda: cluster.client.rm("outputs/busy"),
+        lambda: cluster.client.upload(tmp_path / "new.txt", "inputs/corpus/part0.txt"),
+        # A job must not read output that is still being written.
+        lambda: cluster.client.submit("outputs/busy", "outputs/next", JOBS / "wordcount.py", 1, 1),
+    ]
+    for action in refused:
+        with pytest.raises(grpc.RpcError) as err:
+            action()
+        assert err.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+        assert job_id in err.value.details()
+
+    # Unrelated paths are fine, and the running job is unaffected.
+    cluster.client.upload(tmp_path / "new.txt", "inputs/other/new.txt")
+    assert cluster.client.wait(job_id, timeout=60).state == mr_pb2.JOB_SUCCEEDED
+    cluster.client.rm("inputs/corpus/part0.txt")  # allowed once the job is done

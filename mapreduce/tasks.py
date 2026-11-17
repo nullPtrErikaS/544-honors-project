@@ -148,8 +148,13 @@ def run_map_task(
     spill_bytes: int = DEFAULT_SPILL_BYTES,
     cancel: threading.Event | None = None,
 ) -> Counters:
-    """Run ``job.mapper`` over every line of ``segments``; write partitions to ``out_dir``."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Run ``job.mapper`` over every line of ``segments``; write partitions to ``out_dir``.
+
+    Only ``out_dir`` itself is created, never its parents: if the job has ended and the boss
+    has moved its directories away, a killed attempt that is still running must fail here
+    rather than recreate them.
+    """
+    out_dir.mkdir(exist_ok=True)
     counters: Counters = {"map_input_records": 0, "map_output_records": 0}
     combiner = job.combiner if use_combiner else None
     buffer = MapOutputBuffer(
@@ -179,8 +184,11 @@ def run_reduce_task(
     *,
     cancel: threading.Event | None = None,
 ) -> Counters:
-    """Merge partition ``partition`` from every map output dir, reduce, write ``out_file``."""
-    out_file.parent.mkdir(parents=True, exist_ok=True)
+    """Merge partition ``partition`` from every map output dir, reduce, write ``out_file``.
+
+    Like :func:`run_map_task`, creates only the attempt directory, never its parents.
+    """
+    out_file.parent.mkdir(exist_ok=True)
     counters: Counters = {
         "reduce_input_records": 0,
         "reduce_input_groups": 0,
