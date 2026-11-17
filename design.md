@@ -22,7 +22,11 @@ It answers the questions from the project spec and explains *why* each choice wa
 - Boss fault tolerance. Like the original MapReduce paper, the boss is a single point of
   failure; if it dies, in-flight jobs are lost and must be resubmitted.
 - Sandboxing user code. Job files run as ordinary Python code inside the worker containers.
-- Multi-tenant fairness. Jobs run in FIFO order.
+- Authentication. Anyone who can reach the boss can run code on the workers, so the boss
+  is only reachable from the host itself (§2).
+- Multi-tenant fairness. Jobs get workers in FIFO priority order: an idle worker always
+  takes work from the oldest job that has any, including backup attempts (§8.3). A later
+  job only uses workers that earlier jobs can't keep busy, so jobs can overlap.
 
 ## 2. Architecture
 
@@ -45,7 +49,9 @@ flowchart LR
 - **boss**: one container. It holds all job state in memory, splits input, hands out
   tasks, detects dead workers, launches backup tasks, and commits task output. It also
   serves the storage API the client uses for uploads and downloads. Its port (5440) is
-  published to the host.
+  published on the host's loopback interface only (`127.0.0.1:5440:5440`). The boss has
+  no authentication and runs whatever job code it receives, so it must not be reachable
+  from the network. A client on another machine connects through an SSH tunnel.
 - **worker1..4**: four containers built from the same image, each limited to 1 CPU
   (`cpus: 1.0`). Each worker runs one task at a time.
 - **shared volume**: a Docker named volume mounted at `/data` in the boss and all workers.
@@ -91,12 +97,28 @@ def mapper(key, value):        # key: input file path, value: one line (no newli
 def reducer(key, values):      # values: iterator over all values for key
     yield key, sum(values)
 
-combiner = reducer             # optional; same signature as reducer, must keep the key
+combiner = reducer             # optional; see the combiner rules below
 ```
 
 Keys and values must be JSON-serializable (str, int, float, bool, None, list, dict).
-`mapper` and `reducer` must be deterministic, because tasks may run more than once (retries
-and backups). The boss checks the file with `ast.parse` when the job is submitted. That
+Keys are compared by their JSON encoding, not by Python `==` (§7). So `1`, `1.0`, and
+`True` are three different keys, a dict key with int keys reaches the reducer with string
+keys, and a tuple key reaches the reducer as a list.
+
+`mapper`, `combiner`, and `reducer` must be deterministic, because tasks may run more than
+once (retries and backups).
+
+The combiner is only an optimization, so it may run **zero times** (`--no-combiner`) or
+**several times** on the same key (at every spill and again at the final merge, §8.1). A
+correct combiner therefore:
+- keeps the key it was given (the worker checks this),
+- is associative and commutative, and
+- emits values of the same kind it receives, because its output may be fed back into it or
+  go straight to the reducer.
+
+Word count's `combiner = reducer` follows these rules. A reducer that computes an average
+does not: its averages of partial averages would be wrong. That job needs to emit
+`(sum, count)` pairs and divide only in the reducer. The boss checks the file with `ast.parse` when the job is submitted. That
 catches syntax errors and missing functions early, without the boss executing user code.
 
 ## 4. Language
@@ -145,7 +167,15 @@ written off.
 - The client does **not** mount the volume. It reads and writes it through the boss's
   `Upload`/`Download` streaming RPCs (1 MiB chunks), so the client works the same whether the
   volume is local or not.
-- All user-facing paths are relative to `/data`. The boss rejects absolute paths and `..`.
+- All user-facing paths are relative to `/data`. A leading `/` is allowed and means the
+  same thing (`/inputs/x` is `inputs/x`), and `\` is treated as `/`. Any path containing
+  `..` is rejected. Clients cannot write to the root or to `_jobs/`.
+- **Data in use is locked.** While a job is queued or running, the boss refuses any delete,
+  upload, or `--overwrite` that overlaps the job's input or output. It also refuses a new
+  job whose input overlaps a running job's output, because that job would read partial
+  results. Reads (`ls`, `cat`, `download`) are always allowed. Without the lock, `mr rm` on
+  an input would make every map attempt fail, and `mr upload` over an input would change
+  the bytes after the splits were computed, giving silently wrong output.
 
 Layout:
 
@@ -153,8 +183,9 @@ Layout:
 /data/
   inputs/...                          # user data (uploaded)
   outputs/<name>/part-r-00000 ...     # job output, plus _SUCCESS marker
-  _jobs/<job-id>/map/<attempt-id>/part-00000.kv   # intermediate (deleted on success)
+  _jobs/<job-id>/map/<attempt-id>/part-00000.kv   # intermediate (deleted when the job ends)
   outputs/<name>/_temporary/<attempt-id>/         # reduce output before commit
+  _jobs/_trash/<job-id>/              # a finished job's leftovers, deleted in the background
 ```
 
 ## 7. Data formats and execution
@@ -174,7 +205,10 @@ runs past `end`. Every line is read by exactly one split, and a property-based t
 this.
 
 `mapper(key, value)` gets `key = input file path` (relative to `/data`) and
-`value = line` (UTF-8 decoded, without the trailing newline).
+`value = line`, without its `\n` or `\r\n` line ending. Lines are decoded as UTF-8 with
+`errors="replace"`, so invalid bytes become U+FFFD instead of failing the task. That is the
+right trade-off for messy text corpora, but a job that needs the exact bytes should not
+rely on it.
 
 ### Intermediate data: sorted, JSON-encoded key/value lines
 Each map task writes one file per reduce partition:
@@ -187,6 +221,10 @@ Each map task writes one file per reduce partition:
 and each file is **sorted by the JSON-encoded key string**.
 - JSON keeps types (ints stay ints) and is language-neutral and easy to inspect with `cat`
   when debugging. `json.dumps` escapes tabs and newlines, so `\t` is a safe separator.
+- Keys are encoded with `sort_keys=True` and compact separators, so equal dicts encode the
+  same way whatever their insertion order. The encoded string *is* the key's identity:
+  grouping and partitioning compare encodings, never decoded values (see §3 for what that
+  means for `1` vs `1.0` and for tuples).
 - Sorting by the *encoded* key gives a total order even for keys of mixed types, and the
   reducer can compare keys without decoding them.
 - **Partitioning** uses `crc32(json(key)) % R`. We cannot use Python's built-in `hash()`:
@@ -207,9 +245,16 @@ project.
 
 ### Output: TSV text
 Each reduce task writes `part-r-<NNNNN>`, one `key\tvalue` line per record. A string is
-written as-is, and any other value is written as JSON. The output is plain text, so it can be
-the input of another job, and `./mr cat outputs/wc | sort -t$'\t' -k2 -nr | head` just works.
-When the job succeeds, the boss writes an empty `_SUCCESS` marker.
+written as-is unless it contains a tab, newline, or carriage return. Such a string is
+JSON-encoded (quoted and escaped) so every record stays on one line. Any other value is
+written as JSON. The output is plain text, so `./mr cat outputs/wc | sort -t$'\t' -k2 -nr |
+head` just works, and it can be the input of another job.
+
+The format is for people and shell tools, not a typed round trip: the string `"1"` and the
+int `1` print the same, and the string `[1]` looks like a list. A job that reads another
+job's output gets each line as text and parses the fields itself, for example
+`word, count = value.split("\t")`, then `int(count)`. When the job succeeds, the boss writes
+an empty `_SUCCESS` marker.
 
 ### Commit protocol (the boss is the only committer)
 A task may run several times at once (a backup copy) or one after another (retries). Every
@@ -217,12 +262,22 @@ A task may run several times at once (a backup copy) or one after another (retri
 "wins":
 - **Map**: the attempt writes `_jobs/<job>/map/<attempt-id>/`. The first successful
   `ReportTask` for the task is recorded as committed, and reduce tasks are told to read only
-  from committed attempt directories. Later duplicates are ignored and deleted.
+  from committed attempt directories. Later duplicates are ignored. Their directories stay
+  until the job ends and are deleted with the rest of `_jobs/<job>`, so with backups or
+  retries the volume briefly holds more than one copy of a map task's output.
 - **Reduce**: the attempt writes `<output>/_temporary/<attempt-id>/part-r-NNNNN`. On the
   first successful report, the boss `os.replace`s it to `<output>/part-r-NNNNN`. The rename is
   atomic, so readers never see a partially written file.
-- On job success the boss writes `_SUCCESS` and deletes `_temporary` and the intermediate
-  directory.
+- **Directories.** The boss creates `_jobs/<job>/map/` and `<output>/_temporary/` when the
+  job is submitted. A worker creates only its own attempt directory inside them, never the
+  parents. When a job ends, an attempt the boss has killed may still be running until its
+  next heartbeat. Because it can't recreate a missing parent, its `mkdir` or `open` fails,
+  and that failure report is ignored like any other report from a killed attempt.
+- **Job end.** The boss first atomically renames `_jobs/<job>` and `<output>/_temporary`
+  into `_jobs/_trash/<job>/`. If the job **failed**, it moves the whole output directory
+  there too, so a failed job leaves no partial `part-r-*` files that could pass for results.
+  If the job **succeeded**, it writes `_SUCCESS`. The trash is then deleted in a background
+  thread, and anything left over is removed when the boss next starts.
 
 ## 8. Special features
 
@@ -231,7 +286,8 @@ If the job file defines `combiner` (and `--no-combiner` was not given), map task
 each key's buffered values **at every spill and again during the final merge of spills**. For
 word count, this turns millions of `(word, 1)` records into one record per distinct word per
 map task. Counters (`map_output_records`, `combine_output_records`, `intermediate_bytes`)
-measure the effect.
+measure the effect. Because the combiner can run any number of times, it has to follow the
+rules in §3.
 
 ### 8.2 Worker failure handling
 - The boss tracks `last_seen` for every worker (any RPC counts). A reaper thread declares a
@@ -242,13 +298,27 @@ measure the effect.
   the shared volume, not on the dead worker's local disk, so it is still readable.
 - If a "dead" worker comes back, the heartbeat reply tells it to cancel the attempts the boss
   has written off. A late `ReportTask` from a lost attempt is rejected.
+- **Restarts under the same name.** Workers are named after their container hostname
+  (`worker1`…), so a container that restarts within the 5 s timeout never looks silent.
+  A worker only asks for a task when it is idle. So if a worker calls `RequestTask` while
+  the boss thinks it is still running something, the boss marks that attempt `LOST` and
+  reschedules it at once, without waiting for the timeout.
 - Exceptions in user code mark the attempt `FAILED`, and the task is retried on any worker.
   After 4 failed attempts of one task, the job fails and the user sees the remote traceback.
-  `LOST` attempts do not count toward this limit.
+- `LOST` attempts have their own, lower limit: if attempts of the same task are lost 3
+  times, the job fails with an error saying the task may be crashing its workers. A worker
+  dying while it runs a task is normally not the task's fault, so a loss doesn't count as a
+  failure. But a task whose code kills the worker process instead of raising (`os._exit`, a
+  segfault in a C extension, an out-of-memory kill) would otherwise be retried until no
+  workers were left, and the job would never end. Three losses on one task is very unlikely
+  from unrelated crashes, while it still leaves one of the four workers alive.
 
 ### 8.3 Speculative execution (backup tasks)
-When a worker asks for work and **no task is pending**, the boss looks for a straggler in the
-current phase (map or reduce):
+When a worker asks for work, the boss goes through the jobs oldest first. For each job, it
+hands out a pending task if the job has one. Otherwise it looks for a straggler in that job's
+current phase (map or reduce), and only then moves on to the next job. That way a queued job
+can't keep backup attempts from an older job's stragglers. A task counts as a straggler
+when:
 - the task has exactly one running attempt, on a different worker;
 - at least one task in that phase has finished, which gives us a baseline;
 - the attempt has run longer than `max(1 s, 1.5 × median duration of finished tasks in the
@@ -256,8 +326,9 @@ current phase (map or reduce):
 
 The longest-running candidate gets a **backup attempt** on the idle worker. The first attempt
 to finish is committed (§7), and the boss tells the other worker to cancel via the next
-heartbeat. Workers check for cancellation every 1,000 records, so the loser stops within
-milliseconds and its CPU is freed. Speculation can be turned off per job with
+heartbeat. That reply arrives within about 1 s, and workers check the cancel flag every
+1,000 records, so the loser usually stops within about a second and its CPU is freed. A map
+task that has already started its final merge of spills finishes the merge first. Speculation can be turned off per job with
 `--no-speculation`, which we use to measure its effect.
 
 ## 9. Testing plan
@@ -270,8 +341,9 @@ All tests run with `pytest` in GitHub Actions on every pull request.
 | Unit | Partitioner | Stable across processes (subprocess with different `PYTHONHASHSEED`), in range. |
 | Unit | Map/reduce task execution | Spill + merge produce sorted output; combiner applied; output matches sequential reference. |
 | Unit | Job file validation | Missing `mapper`, syntax errors, combiner detection. |
-| Unit | Scheduler state machine | Fake clock, no threads or network: assignment order, phase transition, retries, failure limit, dead worker → tasks rescheduled, speculation threshold and selection, duplicate commit rejected, cancellation delivered via heartbeat. |
+| Unit | Scheduler state machine | Fake clock, no threads or network: assignment order (FIFO priority, including backups), phase transition, retries, failure limit, lost-attempt limit, dead worker → tasks rescheduled, speculation threshold and selection, duplicate commit rejected, cancellation delivered via heartbeat. |
 | Integration | Real boss + workers as local subprocesses, temp dir as storage | Word count and inverted index produce exactly the output of `mr local`. |
+| Integration | Storage safety | Delete, upload, and `--overwrite` are refused while a running job uses the path; a failed job leaves no output directory; no `_temporary` or intermediate data is left after a job. |
 | Integration | Failure | Kill a worker process mid-job; the job still succeeds with correct output and the status shows `LOST` attempts. |
 | Integration | Stragglers | One deliberately slow worker; backup attempts are launched and win. |
 | End-to-end | Docker Compose | CI builds the images, starts boss + 4 workers, uploads sample data with the real client, runs word count, and diffs the output against `mr local`. |
