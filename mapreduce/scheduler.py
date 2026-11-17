@@ -27,6 +27,7 @@ from mapreduce.splits import Segment
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_TASK_FAILURES = 4
+DEFAULT_WORKER_TIMEOUT = 5.0  # seconds of silence before a worker is declared dead
 RECHECK_INTERVAL = 0.25  # how often a waiting RequestTask re-evaluates time-based rules
 
 
@@ -137,6 +138,7 @@ class Job:
 class Worker:
     id: str
     last_seen: float
+    alive: bool = True
     current: Attempt | None = None
     succeeded: int = 0
 
@@ -172,11 +174,13 @@ class Scheduler:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         max_task_failures: int = DEFAULT_MAX_TASK_FAILURES,
+        worker_timeout: float = DEFAULT_WORKER_TIMEOUT,
     ):
         self.committer = committer
         self.clock = clock
         self.wall_clock = wall_clock
         self.max_task_failures = max_task_failures
+        self.worker_timeout = worker_timeout
         self.lock = threading.Condition()
         self.jobs: dict[str, Job] = {}
         self.workers: dict[str, Worker] = {}
@@ -221,9 +225,58 @@ class Scheduler:
     def try_assign(self, worker_id: str) -> Assignment | None:
         """Hand ``worker_id`` its next attempt, or return None if there is nothing to do."""
         with self.lock:
-            self._touch(worker_id)
+            worker = self._touch(worker_id)
+            if worker.current is not None:
+                # A worker only asks for work when idle, so whatever we thought it was running
+                # is gone (e.g. the container restarted under the same name). Don't wait for
+                # the timeout to reschedule it.
+                self._lose(worker.current, "worker asked for new work")
             attempt = self._choose(worker_id)
             return self._assignment(attempt) if attempt else None
+
+    def heartbeat(self, worker_id: str, running: list[str]) -> list[str]:
+        """Record that a worker is alive; return which of its attempts it should cancel.
+
+        An attempt is cancelled if the boss no longer considers it running on that worker:
+        another attempt of the task won, the job failed, or the worker had been declared
+        dead and its work was already handed to someone else.
+        """
+        with self.lock:
+            self._touch(worker_id)
+            cancel = []
+            for attempt_id in running:
+                attempt = self.attempts.get(attempt_id)
+                if (
+                    attempt is None
+                    or attempt.state is not AttemptState.RUNNING
+                    or attempt.worker_id != worker_id
+                ):
+                    cancel.append(attempt_id)
+            return cancel
+
+    def check_workers(self) -> list[str]:
+        """Declare workers that have been silent too long dead; reschedule their attempts.
+
+        Called periodically by the boss. Returns the ids of newly dead workers. Map output
+        that dead workers already committed is *not* redone: it lives on the shared volume,
+        not on the worker, so it is still readable.
+        """
+        with self.lock:
+            now = self.clock()
+            dead = []
+            for worker in self.workers.values():
+                if worker.alive and now - worker.last_seen > self.worker_timeout:
+                    worker.alive = False
+                    dead.append(worker.id)
+                    log.warning(
+                        "worker %s is dead (silent for %.1fs)", worker.id, now - worker.last_seen
+                    )
+                    for attempt in list(self.attempts.values()):
+                        if attempt.worker_id == worker.id and attempt.state is AttemptState.RUNNING:
+                            self._lose(attempt, f"worker {worker.id} died")
+            if dead:
+                self.lock.notify_all()
+            return dead
 
     def report(
         self,
@@ -326,7 +379,18 @@ class Scheduler:
         log.info("%s %s in %.2fs", job.id, state.value, job.finished - job.submitted)
 
     def _kill(self, attempt: Attempt) -> None:
-        attempt.state, attempt.end = AttemptState.KILLED, self.clock()
+        """Stop an attempt we no longer need. The worker learns via its next heartbeat."""
+        self._stop(attempt, AttemptState.KILLED)
+
+    def _lose(self, attempt: Attempt, reason: str) -> None:
+        """An attempt's worker died. The task becomes pending again unless another attempt
+        is still running. Lost attempts don't count toward the task's failure limit."""
+        log.warning("%s lost: %s", attempt.id, reason)
+        self._stop(attempt, AttemptState.LOST)
+        attempt.error = reason
+
+    def _stop(self, attempt: Attempt, state: AttemptState) -> None:
+        attempt.state, attempt.end = state, self.clock()
         worker = self.workers.get(attempt.worker_id)
         if worker and worker.current is attempt:
             worker.current = None
@@ -338,6 +402,9 @@ class Scheduler:
         if worker is None:
             worker = self.workers[worker_id] = Worker(worker_id, self.clock())
             log.info("worker %s joined", worker_id)
+        elif not worker.alive:
+            worker.alive = True
+            log.info("worker %s is back", worker_id)
         worker.last_seen = self.clock()
         return worker
 

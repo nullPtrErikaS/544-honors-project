@@ -27,20 +27,30 @@ log = logging.getLogger("worker")
 
 RPC_TIMEOUT = 30.0
 MAX_ERROR_CHARS = 8_000
+DEFAULT_HEARTBEAT_INTERVAL = 1.0
 
 
 class Worker:
-    def __init__(self, worker_id: str, boss: str, root: Path):
+    def __init__(
+        self,
+        worker_id: str,
+        boss: str,
+        root: Path,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+    ):
         self.id = worker_id
         self.root = root
+        self.heartbeat_interval = heartbeat_interval
         self.channel = grpc.insecure_channel(boss)
         self.stub = mr_pb2_grpc.CoordinatorStub(self.channel)
         self._jobs: dict[str, jobcode.JobFunctions] = {}  # job_id -> loaded job file
+        self._running: dict[str, threading.Event] = {}  # attempt_id -> its cancel flag
         self._stop = threading.Event()
 
     def run(self) -> None:
         """Main loop. Returns only after :meth:`stop`."""
         log.info("worker %s started", self.id)
+        heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat")
         boss_down_logged = False
         while not self._stop.is_set():
             try:
@@ -54,26 +64,46 @@ class Worker:
                 self._stop.wait(1.0)
                 continue
             boss_down_logged = False
+            if heartbeat.ident is None:
+                # Heartbeat only once the boss has seen us ask for work. Otherwise a worker
+                # still in its startup retry would already be listed as alive but idle.
+                heartbeat.start()
             if assignment.has_task:
                 self.execute(assignment)
 
     def stop(self) -> None:
         self._stop.set()
 
+    def _heartbeat_loop(self) -> None:
+        """Tell the boss we're alive; stop attempts the boss no longer wants."""
+        while not self._stop.wait(self.heartbeat_interval):
+            request = mr_pb2.HeartbeatRequest(
+                worker_id=self.id, running_attempts=list(self._running)
+            )
+            try:
+                reply = self.stub.Heartbeat(request, timeout=RPC_TIMEOUT)
+            except grpc.RpcError:
+                continue  # the main loop logs connectivity problems
+            for attempt_id in reply.cancel_attempts:
+                if (cancel := self._running.get(attempt_id)) is not None:
+                    log.info("boss cancelled %s", attempt_id)
+                    cancel.set()
+
     def execute(self, a: mr_pb2.TaskAssignment) -> None:
         log.info("running %s", a.attempt_id)
         started = time.monotonic()
-        cancel = threading.Event()
+        cancel = self._running[a.attempt_id] = threading.Event()
         counters: Counters = {}
         try:
             counters = self._run(a, cancel)
             success, error = True, ""
         except TaskCancelled:
-            log.info("%s cancelled", a.attempt_id)
-            success, error = False, "cancelled"
+            success, error = False, "cancelled by the boss"
         except Exception:
             success, error = False, traceback.format_exc()[-MAX_ERROR_CHARS:]
             log.warning("%s failed:\n%s", a.attempt_id, error)
+        finally:
+            del self._running[a.attempt_id]
         log.info(
             "%s %s in %.2fs",
             a.attempt_id,
@@ -124,9 +154,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--boss", default=os.environ.get("MR_BOSS", "localhost:5440"))
     parser.add_argument("--data", default=os.environ.get("MR_DATA", "/data"), help="storage root")
     parser.add_argument("--id", default=os.environ.get("MR_WORKER_ID") or socket.gethostname())
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=float(os.environ.get("MR_HEARTBEAT_INTERVAL", DEFAULT_HEARTBEAT_INTERVAL)),
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    Worker(args.id, args.boss, Path(args.data)).run()
+    Worker(args.id, args.boss, Path(args.data), args.heartbeat_interval).run()
 
 
 if __name__ == "__main__":

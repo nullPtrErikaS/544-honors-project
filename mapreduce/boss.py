@@ -22,7 +22,14 @@ from pathlib import Path
 import grpc
 
 from mapreduce import jobcode, jobfiles, mr_pb2, mr_pb2_grpc, storage
-from mapreduce.scheduler import Assignment, Attempt, Job, JobSpec, Scheduler
+from mapreduce.scheduler import (
+    DEFAULT_WORKER_TIMEOUT,
+    Assignment,
+    Attempt,
+    Job,
+    JobSpec,
+    Scheduler,
+)
 from mapreduce.splits import compute_splits
 
 log = logging.getLogger("boss")
@@ -180,7 +187,7 @@ class BossService(mr_pb2_grpc.BossServicer):
             workers = [
                 mr_pb2.WorkerInfo(
                     worker_id=w.id,
-                    alive=True,
+                    alive=w.alive,
                     last_seen_ago=now - w.last_seen,
                     current_attempt=w.current.id if w.current else "",
                     attempts_succeeded=w.succeeded,
@@ -304,6 +311,16 @@ class CoordinatorService(mr_pb2_grpc.CoordinatorServicer):
         )
         return mr_pb2.TaskReportReply(accepted=accepted)
 
+    def Heartbeat(self, request, context):
+        cancel = self.scheduler.heartbeat(request.worker_id, list(request.running_attempts))
+        return mr_pb2.HeartbeatReply(cancel_attempts=cancel)
+
+
+def run_reaper(scheduler: Scheduler, stop: threading.Event, interval: float = 0.5) -> None:
+    """Periodically declare silent workers dead so their tasks get rescheduled."""
+    while not stop.wait(interval):
+        scheduler.check_workers()
+
 
 # ---------------------------------------------------------------------- main
 
@@ -320,6 +337,12 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="MapReduce boss")
     parser.add_argument("--port", type=int, default=int(os.environ.get("MR_PORT", DEFAULT_PORT)))
     parser.add_argument("--data", default=os.environ.get("MR_DATA", "/data"), help="storage root")
+    parser.add_argument(
+        "--worker-timeout",
+        type=float,
+        default=float(os.environ.get("MR_WORKER_TIMEOUT", DEFAULT_WORKER_TIMEOUT)),
+        help="seconds without a heartbeat before a worker is declared dead",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -327,9 +350,12 @@ def main(argv: list[str] | None = None) -> None:
     root.mkdir(parents=True, exist_ok=True)
     committer = jobfiles.FilesystemCommitter(root)
     committer.reset()
-    scheduler = Scheduler(committer)
+    scheduler = Scheduler(committer, worker_timeout=args.worker_timeout)
     server = build_server(scheduler, root, f"[::]:{args.port}")
     server.start()
+    threading.Thread(
+        target=run_reaper, args=(scheduler, threading.Event()), daemon=True, name="reaper"
+    ).start()
     log.info("listening on port %d, storage root %s", args.port, root)
     server.wait_for_termination()
 
