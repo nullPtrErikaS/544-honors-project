@@ -121,6 +121,11 @@ def test_existing_output_requires_overwrite(cluster):
     assert err.value.code() == grpc.StatusCode.ALREADY_EXISTS
     status = cluster.run_job("wordcount.py", "inputs/corpus", "outputs/o", 2, 2, overwrite=True)
     assert status.state == mr_pb2.JOB_SUCCEEDED
+    # The boss deletes _temporary in the background after the job ends; don't race it.
+    temp = cluster.root / "outputs" / "o" / "_temporary"
+    deadline = time.monotonic() + 5
+    while temp.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
     names = [f.path.rsplit("/", 1)[-1] for f in cluster.client.ls("outputs/o")]
     assert names == ["_SUCCESS", "part-r-00000", "part-r-00001"]
 
