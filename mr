@@ -1,0 +1,5 @@
+#!/bin/sh
+# Convenience wrapper for the MapReduce client: ./mr <command> [args...]
+# Equivalent to `python3 -m mapreduce.client`, runnable from any directory.
+here="$(cd "$(dirname "$0")" && pwd)"
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec "${PYTHON:-python3}" -m mapreduce.client "$@"

@@ -1,0 +1,4 @@
+# Runtime dependencies for the boss, workers, and the client.
+grpcio==1.85.1
+grpcio-tools==1.85.1
+protobuf==7.36.2

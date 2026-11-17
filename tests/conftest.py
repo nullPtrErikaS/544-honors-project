@@ -6,9 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from mapreduce import jobcode, storage
+from mapreduce import jobcode, protogen, storage
 from mapreduce.splits import compute_splits
 from mapreduce.tasks import run_map_task, run_reduce_task
+
+# Generate mr_pb2*.py if mr.proto changed, so `pytest` works right after a fresh clone.
+if protogen.is_stale():
+    protogen.build()
 
 REPO = Path(__file__).resolve().parent.parent
 JOBS = REPO / "examples" / "jobs"

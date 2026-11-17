@@ -1,0 +1,204 @@
+syntax = "proto3";
+
+package mapreduce;
+
+// =====================================================================================
+// Client-facing API (the `mr` CLI on the host talks to this).
+// =====================================================================================
+service Boss {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobReply);
+  rpc GetJob(GetJobRequest) returns (JobStatus);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsReply);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersReply);
+
+  // Shared storage access. Paths are relative to the storage root.
+  rpc Upload(stream FileChunk) returns (UploadReply);
+  rpc Download(DownloadRequest) returns (stream FileChunk);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesReply);
+  rpc DeletePath(DeletePathRequest) returns (DeletePathReply);
+}
+
+// =====================================================================================
+// Worker-facing API. Workers pull work: they ask for a task, run it, and report back.
+// =====================================================================================
+service Coordinator {
+  // Long poll: the boss holds the call for up to ~1 s if no task is available.
+  rpc RequestTask(TaskRequest) returns (TaskAssignment);
+  rpc ReportTask(TaskReport) returns (TaskReportReply);
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_QUEUED = 1;
+  JOB_MAPPING = 2;
+  JOB_REDUCING = 3;
+  JOB_SUCCEEDED = 4;
+  JOB_FAILED = 5;
+}
+
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  MAP = 1;
+  REDUCE = 2;
+}
+
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_RUNNING = 1;
+  ATTEMPT_SUCCEEDED = 2;
+  ATTEMPT_FAILED = 3;   // user code raised an exception
+  ATTEMPT_KILLED = 4;   // cancelled by the boss (job failed, or another attempt won)
+  ATTEMPT_LOST = 5;     // the worker running it died
+}
+
+// ----------------------------------- jobs ------------------------------------------
+
+message SubmitJobRequest {
+  string input_path = 1;        // file or directory in shared storage
+  string output_path = 2;       // directory in shared storage
+  string job_source = 3;        // Python source defining mapper/reducer[/combiner]
+  string job_filename = 4;      // used in tracebacks and job listings
+  int32 num_map_tasks = 5;
+  int32 num_reduce_tasks = 6;
+  bool overwrite_output = 7;    // replace output_path if it already exists
+}
+
+message SubmitJobReply {
+  string job_id = 1;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message AttemptInfo {
+  string attempt_id = 1;
+  TaskKind kind = 2;
+  int32 task_index = 3;
+  string worker_id = 4;
+  AttemptState state = 5;
+  double start = 6;             // seconds since the job was submitted
+  double end = 7;               // seconds since the job was submitted; 0 while running
+  bool speculative = 8;         // true for backup attempts of stragglers
+  string error = 9;
+}
+
+message JobStatus {
+  string job_id = 1;
+  string job_name = 2;
+  JobState state = 3;
+  string error = 4;
+  string input_path = 5;
+  string output_path = 6;
+  int32 num_map_tasks = 7;
+  int32 num_reduce_tasks = 8;
+  int32 maps_done = 9;
+  int32 reduces_done = 10;
+  double submitted_at = 11;     // unix timestamp
+  double elapsed = 12;          // seconds from submission to completion (or now)
+  map<string, int64> counters = 13;
+  repeated AttemptInfo attempts = 14;  // only filled in by GetJob
+}
+
+message ListJobsRequest {}
+
+message ListJobsReply {
+  repeated JobStatus jobs = 1;
+}
+
+message ListWorkersRequest {}
+
+message WorkerInfo {
+  string worker_id = 1;
+  bool alive = 2;
+  double last_seen_ago = 3;     // seconds
+  string current_attempt = 4;
+  int32 attempts_succeeded = 5;
+}
+
+message ListWorkersReply {
+  repeated WorkerInfo workers = 1;
+}
+
+// ---------------------------------- storage ----------------------------------------
+
+// Files are streamed as consecutive chunks. A chunk whose path differs from the previous
+// chunk's starts a new file. Empty files are sent as one chunk with no data.
+message FileChunk {
+  string path = 1;
+  bytes data = 2;
+}
+
+message UploadReply {
+  int32 files = 1;
+  int64 bytes = 2;
+}
+
+message DownloadRequest {
+  string path = 1;
+  bool include_hidden = 2;      // also send _SUCCESS, _temporary, ...
+}
+
+message ListFilesRequest {
+  string path = 1;
+}
+
+message FileInfo {
+  string path = 1;
+  int64 size = 2;
+  bool is_dir = 3;
+}
+
+message ListFilesReply {
+  repeated FileInfo files = 1;
+}
+
+message DeletePathRequest {
+  string path = 1;
+}
+
+message DeletePathReply {}
+
+// ----------------------------------- tasks -----------------------------------------
+
+message TaskRequest {
+  string worker_id = 1;
+}
+
+message InputSegment {
+  string path = 1;
+  int64 start = 2;
+  int64 end = 3;
+}
+
+message TaskAssignment {
+  bool has_task = 1;            // false: nothing to do right now, ask again
+  string job_id = 2;
+  string attempt_id = 3;
+  TaskKind kind = 4;
+  int32 task_index = 5;
+  string job_source = 6;
+  string job_filename = 7;
+  int32 num_reduce_tasks = 8;
+
+  // MAP: read these segments, write one sorted file per partition into output_dir.
+  repeated InputSegment segments = 9;
+  // REDUCE: merge partition `task_index` from these committed map output dirs and
+  // write output_file (a private temporary file; the boss commits it).
+  repeated string map_output_dirs = 10;
+
+  string output_dir = 11;       // MAP only
+  string output_file = 12;      // REDUCE only
+}
+
+message TaskReport {
+  string worker_id = 1;
+  string attempt_id = 2;
+  bool success = 3;
+  string error = 4;             // traceback when success is false
+  map<string, int64> counters = 5;
+}
+
+message TaskReportReply {
+  bool accepted = 1;            // false if the attempt was already written off
+}
