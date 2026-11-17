@@ -18,6 +18,8 @@ from pathlib import Path
 
 from mapreduce import storage
 
+SKIP_CHUNK = 1 << 20  # bytes read at a time when skipping a partial first line
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -40,13 +42,18 @@ def compute_splits(files: list[tuple[str, int]], num_splits: int) -> list[list[S
     bounds = [i * total // num_splits for i in range(num_splits + 1)]
     splits: list[list[Segment]] = [[] for _ in range(num_splits)]
 
-    offset = 0
+    # Files and splits are both in byte order, so walk them together: O(files + splits).
+    offset = first = 0
     for path, size in files:
         file_start, file_end = offset, offset + size
-        for i in range(num_splits):
+        while first < num_splits - 1 and bounds[first + 1] <= file_start:
+            first += 1  # split `first` ends before this file starts
+        i = first
+        while i < num_splits and bounds[i] < file_end:
             lo, hi = max(bounds[i], file_start), min(bounds[i + 1], file_end)
             if lo < hi:
                 splits[i].append(Segment(path, lo - file_start, hi - file_start))
+            i += 1
         offset = file_end
     return splits
 
@@ -58,7 +65,7 @@ def read_segment(root: Path, seg: Segment) -> Iterator[str]:
             # The line containing byte start-1 began before our range, so it belongs to the
             # previous segment. If byte start-1 is a newline this consumes just that byte.
             f.seek(seg.start - 1)
-            f.readline()
+            _skip_rest_of_line(f)
         pos = f.tell()
         while pos < seg.end:
             line = f.readline()
@@ -70,3 +77,10 @@ def read_segment(root: Path, seg: Segment) -> Iterator[str]:
             if line.endswith(b"\r"):  # also accept Windows line endings
                 line = line[:-1]
             yield line.decode("utf-8", errors="replace")
+
+
+def _skip_rest_of_line(f) -> None:
+    """Move past the next newline (or to EOF) without holding a long line in memory."""
+    while chunk := f.readline(SKIP_CHUNK):
+        if chunk.endswith(b"\n"):
+            return

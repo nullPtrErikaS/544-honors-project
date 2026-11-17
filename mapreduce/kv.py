@@ -13,6 +13,7 @@ sorted by the JSON-encoded key string. Working on encoded keys means
 from __future__ import annotations
 
 import heapq
+import itertools
 import json
 import zlib
 from collections.abc import Iterable, Iterator
@@ -30,6 +31,9 @@ encode_value = json.JSONEncoder(separators=(",", ":")).encode
 decode = json.loads
 
 _by_key = itemgetter(0)
+
+MERGE_FACTOR = 100  # most run files one merge reads at once (like Hadoop's io.sort.factor)
+_merge_ids = itertools.count()
 
 
 def partition(encoded_key: str, num_partitions: int) -> int:
@@ -72,10 +76,45 @@ def sort_records(records: list[Record]) -> list[Record]:
     return records
 
 
-def merge_runs(paths: list[Path], stack: ExitStack) -> Iterator[Record]:
-    """K-way merge of sorted run files (streaming; files are closed by ``stack``)."""
+def merge_runs(
+    paths: list[Path],
+    stack: ExitStack,
+    tmp_dir: Path | None = None,
+    factor: int = MERGE_FACTOR,
+) -> Iterator[Record]:
+    """K-way merge of sorted run files (streaming; files are closed by ``stack``).
+
+    At most ``factor`` files are open at once, so a reduce task with thousands of map inputs
+    doesn't run out of file descriptors. With more inputs, groups of ``factor`` runs are
+    first merged into temporary runs in ``tmp_dir``, in as many passes as needed. The
+    temporary runs are deleted when ``stack`` closes. Equal keys keep the order of ``paths``.
+    """
+    if len(paths) > factor:
+        if tmp_dir is None:
+            raise ValueError(f"merging more than {factor} runs needs a tmp_dir")
+        paths = _merge_passes(paths, tmp_dir, factor, stack)
     readers = [stack.enter_context(closing(read_run(p))) for p in paths]
     return heapq.merge(*readers, key=_by_key)
+
+
+def _merge_passes(paths: list[Path], tmp_dir: Path, factor: int, stack: ExitStack) -> list[Path]:
+    temps: list[Path] = []  # temporary runs that still exist
+    stack.callback(lambda: [p.unlink(missing_ok=True) for p in temps])
+    while len(paths) > factor:
+        merged = []
+        for i in range(0, len(paths), factor):
+            group = paths[i : i + factor]
+            out = tmp_dir / f"_merge-{next(_merge_ids):06d}.kv"  # hidden: never job input
+            with ExitStack() as inner:
+                write_run(out, merge_runs(group, inner))
+            for p in group:  # inputs from an earlier pass are no longer needed
+                if p in temps:
+                    p.unlink()
+                    temps.remove(p)
+            temps.append(out)
+            merged.append(out)
+        paths = merged
+    return paths
 
 
 def group_by_key(records: Iterable[Record]) -> Iterator[tuple[str, Iterator[Record]]]:
@@ -83,15 +122,25 @@ def group_by_key(records: Iterable[Record]) -> Iterator[tuple[str, Iterator[Reco
     return groupby(records, key=_by_key)
 
 
+# TAB plus every character ``str.splitlines()`` treats as a line break. An output string
+# containing one is JSON-encoded, so each record stays one line for any line reader.
+_SEPARATORS = "\t\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+# json.dumps escapes control characters below U+0020, but with ensure_ascii=False it leaves
+# these three raw.
+_EXTRA_ESCAPES = str.maketrans({"\x85": "\\u0085", "\u2028": "\\u2028", "\u2029": "\\u2029"})
+
+
 def _text(x: object) -> str:
-    if isinstance(x, str) and not any(c in x for c in "\t\n\r"):
+    if isinstance(x, str) and not any(c in x for c in _SEPARATORS):
         return x
-    return json.dumps(x)
+    # ensure_ascii=False: the output is UTF-8, so "café" inside a list stays readable.
+    return json.dumps(x, ensure_ascii=False).translate(_EXTRA_ESCAPES)
 
 
 def format_output(key: object, value: object) -> str:
     """One line of final job output: ``key TAB value``.
 
-    Strings are written as-is (unless they contain a tab/newline); everything else as JSON.
+    Strings are written as-is unless they contain a tab or a line break; everything else
+    (and those strings) as JSON.
     """
     return f"{_text(key)}\t{_text(value)}\n"

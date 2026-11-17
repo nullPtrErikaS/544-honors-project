@@ -20,13 +20,18 @@ from mapreduce.jobcode import JobFunctions, pairs
 from mapreduce.splits import Segment, read_segment
 
 DEFAULT_SPILL_THRESHOLD = 500_000  # buffered map output records before sorting to disk
-CANCEL_CHECK_EVERY = 1_000  # records between checks of the cancel flag
+DEFAULT_SPILL_BYTES = 64 << 20  # ...or this much encoded data, whichever comes first
+CANCEL_CHECK_EVERY = 1_000  # reduce input values between checks of the cancel flag
 
 Counters = dict[str, int]
 
 
-class TaskCancelled(Exception):
-    """The boss told us to stop (e.g. another attempt of this task already finished)."""
+class TaskCancelled(BaseException):
+    """The boss told us to stop (e.g. another attempt of this task already finished).
+
+    A ``BaseException``, like ``GeneratorExit``: it is raised inside user code (the reducer's
+    ``values`` iterator), and a reducer's ``except Exception`` must not swallow it.
+    """
 
 
 def _check_cancel(cancel: threading.Event | None) -> None:
@@ -37,28 +42,37 @@ def _check_cancel(cancel: threading.Event | None) -> None:
 class MapOutputBuffer:
     """Collects map output, partitions it, and writes sorted partition files.
 
-    Records are buffered per partition. When ``spill_threshold`` records are buffered,
-    each partition is sorted and written as a *spill* run. At the end, spills are merged
-    into one sorted file per partition, so memory use is bounded by the threshold.
+    Records are buffered per partition. When ``spill_threshold`` records or ``spill_bytes``
+    of encoded data are buffered, each partition is sorted and written as a *spill* run. At
+    the end, spills are merged into one sorted file per partition, so memory use is bounded
+    by the thresholds.
     """
 
     def __init__(
-        self, num_partitions: int, out_dir: Path, spill_threshold: int, counters: Counters
+        self,
+        num_partitions: int,
+        out_dir: Path,
+        spill_threshold: int,
+        counters: Counters,
+        spill_bytes: int = DEFAULT_SPILL_BYTES,
     ):
         self.num_partitions = num_partitions
         self.out_dir = out_dir
         self.spill_threshold = spill_threshold
+        self.spill_bytes = spill_bytes
         self.counters = counters
         self.buffers: list[list[kv.Record]] = [[] for _ in range(num_partitions)]
         self.buffered = 0
+        self.buffered_bytes = 0
         self.spill_files: list[list[Path]] = [[] for _ in range(num_partitions)]
         self.num_spills = 0
 
     def add(self, key: Any, value: Any) -> None:
-        k = kv.encode_key(key)
-        self.buffers[kv.partition(k, self.num_partitions)].append((k, kv.encode_value(value)))
+        k, v = kv.encode_key(key), kv.encode_value(value)
+        self.buffers[kv.partition(k, self.num_partitions)].append((k, v))
         self.buffered += 1
-        if self.buffered >= self.spill_threshold:
+        self.buffered_bytes += len(k) + len(v)
+        if self.buffered >= self.spill_threshold or self.buffered_bytes >= self.spill_bytes:
             self._spill()
 
     def _spill(self) -> None:
@@ -69,7 +83,7 @@ class MapOutputBuffer:
                 self.spill_files[p].append(path)
         self.num_spills += 1
         self.buffers = [[] for _ in range(self.num_partitions)]
-        self.buffered = 0
+        self.buffered = self.buffered_bytes = 0
 
     def finish(self) -> None:
         """Write the final ``part-NNNNN.kv`` file for every partition (empty ones too)."""
@@ -82,7 +96,8 @@ class MapOutputBuffer:
                 nbytes += kv.write_run(final, kv.sort_records(self.buffers[p]))
                 continue
             with ExitStack() as stack:
-                nbytes += kv.write_run(final, kv.merge_runs(self.spill_files[p], stack))
+                merged = kv.merge_runs(self.spill_files[p], stack, tmp_dir=self.out_dir)
+                nbytes += kv.write_run(final, merged)
             for path in self.spill_files[p]:
                 path.unlink()
         self.counters["spills"] = self.num_spills
@@ -97,18 +112,20 @@ def run_map_task(
     out_dir: Path,
     *,
     spill_threshold: int = DEFAULT_SPILL_THRESHOLD,
+    spill_bytes: int = DEFAULT_SPILL_BYTES,
     cancel: threading.Event | None = None,
 ) -> Counters:
     """Run ``job.mapper`` over every line of ``segments``; write partitions to ``out_dir``."""
     out_dir.mkdir(parents=True, exist_ok=True)
     counters: Counters = {"map_input_records": 0, "map_output_records": 0}
-    buffer = MapOutputBuffer(num_reduce, out_dir, spill_threshold, counters)
+    buffer = MapOutputBuffer(num_reduce, out_dir, spill_threshold, counters, spill_bytes)
     n_in = n_out = 0
     for seg in segments:
         for line in read_segment(root, seg):
             n_in += 1
-            if n_in % CANCEL_CHECK_EVERY == 0:
-                _check_cancel(cancel)
+            # Every line: the attempt being cancelled is usually the slow one, and is_set()
+            # costs far less than running the mapper.
+            _check_cancel(cancel)
             for k, v in pairs(job.mapper(seg.path, line), "mapper"):
                 buffer.add(k, v)
                 n_out += 1
@@ -144,7 +161,9 @@ def run_reduce_task(
 
     with ExitStack() as stack:
         out = stack.enter_context(open(out_file, "w", encoding="utf-8", newline="\n"))
-        for encoded_key, group in kv.group_by_key(kv.merge_runs(inputs, stack)):
+        merged = kv.merge_runs(inputs, stack, tmp_dir=out_file.parent)
+        for encoded_key, group in kv.group_by_key(merged):
+            _check_cancel(cancel)  # every key, and every CANCEL_CHECK_EVERY values within one
             counters["reduce_input_groups"] += 1
             for k, v in pairs(job.reducer(kv.decode(encoded_key), values(group)), "reducer"):
                 out.write(kv.format_output(k, v))

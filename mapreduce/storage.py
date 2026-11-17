@@ -8,7 +8,7 @@ nobody can escape the root with ``..``.
 from __future__ import annotations
 
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 
 class StorageError(ValueError):
@@ -16,11 +16,14 @@ class StorageError(ValueError):
 
 
 def normalize(rel: str) -> str:
-    """Canonical form of a storage path: posix separators, no leading slash, no ``.``.
+    """Canonical form of a storage path: ``/``-separated, no empty or ``.`` components.
 
-    A leading ``/`` is accepted and means "relative to the storage root".
+    A leading ``/`` is accepted and means "relative to the storage root", ``\\`` is treated
+    as ``/``, and repeated slashes collapse. Path checks compare this form, so every
+    spelling of a path must normalize to the same string. (``PurePosixPath`` won't do: it
+    keeps a leading ``//`` as a separate root.)
     """
-    parts = [p for p in PurePosixPath(rel.strip().replace("\\", "/")).parts if p not in ("/", ".")]
+    parts = [p for p in rel.strip().replace("\\", "/").split("/") if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise StorageError(f"'..' is not allowed in storage paths: {rel!r}")
     return "/".join(parts)

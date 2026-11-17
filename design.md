@@ -118,8 +118,12 @@ correct combiner therefore:
 
 Word count's `combiner = reducer` follows these rules. A reducer that computes an average
 does not: its averages of partial averages would be wrong. That job needs to emit
-`(sum, count)` pairs and divide only in the reducer. The boss checks the file with `ast.parse` when the job is submitted. That
-catches syntax errors and missing functions early, without the boss executing user code.
+`(sum, count)` pairs and divide only in the reducer.
+
+The boss checks the file with `ast.parse` when the job is submitted. That catches syntax
+errors and missing functions early (including definitions inside top-level `if`, `try`, and
+`with` blocks), without the boss executing user code. Every result of a user function must
+be a `(key, value)` tuple or a two-item list.
 
 ## 4. Language
 
@@ -168,8 +172,8 @@ written off.
   `Upload`/`Download` streaming RPCs (1 MiB chunks), so the client works the same whether the
   volume is local or not.
 - All user-facing paths are relative to `/data`. A leading `/` is allowed and means the
-  same thing (`/inputs/x` is `inputs/x`), and `\` is treated as `/`. Any path containing
-  `..` is rejected. Clients cannot write to the root or to `_jobs/`.
+  same thing (`/inputs/x` is `inputs/x`), `\` is treated as `/`, and repeated slashes
+  collapse (`//inputs//x` is `inputs/x`). Any path containing `..` is rejected. Clients cannot write to the root or to `_jobs/`.
 - **Data in use is locked.** While a job is queued or running, the boss refuses any delete,
   upload, or `--overwrite` that overlaps the job's input or output. It also refuses a new
   job whose input overlaps a running job's output, because that job would read partial
@@ -231,12 +235,16 @@ and each file is **sorted by the JSON-encoded key string**.
   it is randomized per process (`PYTHONHASHSEED`), so two map workers would send the same key
   to different reducers.
 - **Spilling.** A map task buffers output in memory and, past a threshold (default 500k
-  records), sorts it and writes ("spills") a sorted run to disk. When the task finishes, the
-  runs are merged with `heapq.merge`. Map tasks therefore use bounded memory on large splits.
+  records or 64 MiB of encoded data, whichever comes first), sorts it and writes ("spills")
+  a sorted run to disk. When the task finishes, the runs are merged with `heapq.merge`. Map
+  tasks therefore use bounded memory on large splits.
 
 The reducer streams a k-way merge (`heapq.merge`) over its partition file from every map task
 and groups adjacent equal keys with `itertools.groupby`. It decodes values lazily, so the
-reduce side also runs in bounded memory and never sorts in memory.
+reduce side also runs in bounded memory and never sorts in memory. A merge reads at most 100
+files at once. With more inputs (more than 100 map tasks, or spills), groups of 100 are
+first merged into temporary runs, in as many passes as needed. A reduce task therefore never
+needs more than about 100 file descriptors, however many map tasks the job has.
 
 We considered Arrow/Parquet and protobuf for intermediate data. They would be faster and
 more compact, but they need a schema, and our keys and values are arbitrary JSON-like Python
@@ -245,9 +253,10 @@ project.
 
 ### Output: TSV text
 Each reduce task writes `part-r-<NNNNN>`, one `key\tvalue` line per record. A string is
-written as-is unless it contains a tab, newline, or carriage return. Such a string is
-JSON-encoded (quoted and escaped) so every record stays on one line. Any other value is
-written as JSON. The output is plain text, so `./mr cat outputs/wc | sort -t$'\t' -k2 -nr |
+written as-is unless it contains a tab or any character Python's `str.splitlines()`
+treats as a line break. Such a string is JSON-encoded (quoted and escaped) so every record
+stays on one line. Any other value is written as JSON, with non-ASCII text kept as UTF-8
+(`["café.txt"]`, not `["caf\u00e9.txt"]`). The output is plain text, so `./mr cat outputs/wc | sort -t$'\t' -k2 -nr |
 head` just works, and it can be the input of another job.
 
 The format is for people and shell tools, not a typed round trip: the string `"1"` and the
@@ -326,9 +335,10 @@ when:
 
 The longest-running candidate gets a **backup attempt** on the idle worker. The first attempt
 to finish is committed (§7), and the boss tells the other worker to cancel via the next
-heartbeat. That reply arrives within about 1 s, and workers check the cancel flag every
-1,000 records, so the loser usually stops within about a second and its CPU is freed. A map
-task that has already started its final merge of spills finishes the merge first. Speculation can be turned off per job with
+heartbeat. That reply arrives within about 1 s. Map tasks check the cancel flag before every
+input line, and reduce tasks before every key and every 1,000 values, so the loser usually
+stops within about a second and its CPU is freed. A map task that has already started its
+final merge of spills finishes the merge first. Speculation can be turned off per job with
 `--no-speculation`, which we use to measure its effect.
 
 ## 9. Testing plan

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from mapreduce import kv, storage
-from mapreduce.jobcode import load_job
+from mapreduce.jobcode import JobFunctions, load_job
 from mapreduce.local import run_local
 from mapreduce.splits import Segment, compute_splits
 from mapreduce.tasks import TaskCancelled, run_map_task, run_reduce_task
@@ -84,3 +84,46 @@ def test_user_exception_propagates(sample_root):
         run_map_task(
             job, sample_root, [Segment("inputs/sample/a.txt", 0, 10)], 1, sample_root / "m"
         )
+
+
+def test_reducer_cannot_swallow_cancellation(tmp_path):
+    job = load_job(
+        "def mapper(k, v):\n    yield v, 1\n"
+        "def reducer(k, vs):\n"
+        "    try:\n        total = sum(vs)\n    except Exception:\n        total = -1\n"
+        "    yield k, total\n"
+    )
+    write_corpus(tmp_path, "in", {"f.txt": "w\n" * 3000})
+    run_map_task(job, tmp_path, [Segment("in/f.txt", 0, 6000)], 1, tmp_path / "m")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(TaskCancelled):
+        run_reduce_task(job, [tmp_path / "m"], 0, tmp_path / "out", cancel=cancel)
+
+
+def test_map_checks_cancel_before_every_line(tmp_path):
+    calls = []
+    cancel = threading.Event()
+
+    def mapper(k, v):
+        calls.append(v)
+        cancel.set()  # cancelled while handling the very first line
+        yield v, 1
+
+    job = JobFunctions(mapper=mapper, reducer=lambda k, vs: [(k, sum(vs))])
+    write_corpus(tmp_path, "in", {"f.txt": "a\nb\nc\n"})
+    with pytest.raises(TaskCancelled):
+        run_map_task(job, tmp_path, [Segment("in/f.txt", 0, 6)], 1, tmp_path / "m", cancel=cancel)
+    assert calls == ["a"]
+
+
+def test_spills_on_buffered_bytes(sample_root):
+    job = load_example("wordcount.py")
+    [segments] = compute_splits(storage.list_input_files(sample_root, "inputs"), 1)
+    by_bytes = run_map_task(job, sample_root, segments, 2, sample_root / "b", spill_bytes=40)
+    by_records = run_map_task(job, sample_root, segments, 2, sample_root / "r")
+    assert by_bytes["spills"] > 1 and by_records["spills"] == 0
+    for p in range(2):
+        name = kv.partition_filename(p)
+        spilled, unspilled = sample_root / "b" / name, sample_root / "r" / name
+        assert list(kv.read_run(spilled)) == list(kv.read_run(unspilled))

@@ -65,3 +65,33 @@ def test_segment_starting_on_line_boundary(tmp_path):
     assert list(read_segment(tmp_path, Segment("f", 0, 3))) == ["ab"]
     # A segment starting mid-line skips the partial line.
     assert list(read_segment(tmp_path, Segment("f", 4, 9))) == ["ef"]
+
+
+def naive_splits(files, n):
+    """The obvious O(files x splits) version, as a reference."""
+    total = sum(size for _, size in files)
+    bounds = [i * total // n for i in range(n + 1)]
+    out, offset = [[] for _ in range(n)], 0
+    for path, size in files:
+        for i in range(n):
+            lo, hi = max(bounds[i], offset), min(bounds[i + 1], offset + size)
+            if lo < hi:
+                out[i].append(Segment(path, lo - offset, hi - offset))
+        offset += size
+    return out
+
+
+def test_compute_splits_matches_reference():
+    rng = random.Random(7)
+    for _ in range(500):
+        files = [(f"f{i}", rng.choice([0, 0, 1, 3, 50, 400])) for i in range(rng.randint(0, 12))]
+        n = rng.randint(1, 20)
+        assert compute_splits(files, n) == naive_splits(files, n), (files, n)
+
+
+def test_long_partial_line_is_skipped(tmp_path):
+    long_line = b"x" * (3 * (1 << 20) + 17)
+    (tmp_path / "f").write_bytes(long_line + b"\nnext\n")
+    size = len(long_line) + 6
+    assert list(read_segment(tmp_path, Segment("f", 1, size))) == ["next"]
+    assert list(read_segment(tmp_path, Segment("f", 5, len(long_line)))) == []
