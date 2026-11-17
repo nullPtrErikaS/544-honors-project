@@ -50,7 +50,7 @@ class Worker:
     def run(self) -> None:
         """Main loop. Returns only after :meth:`stop`."""
         log.info("worker %s started", self.id)
-        threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat").start()
+        heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True, name="heartbeat")
         boss_down_logged = False
         while not self._stop.is_set():
             try:
@@ -64,6 +64,10 @@ class Worker:
                 self._stop.wait(1.0)
                 continue
             boss_down_logged = False
+            if heartbeat.ident is None:
+                # Heartbeat only once the boss has seen us ask for work. Otherwise a worker
+                # still in its startup retry would already be listed as alive but idle.
+                heartbeat.start()
             if assignment.has_task:
                 self.execute(assignment)
 
