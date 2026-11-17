@@ -208,14 +208,47 @@ def test_committed_map_output_of_dead_worker_is_kept(sched, clock):
     assert job.state is JobState.SUCCEEDED
 
 
+def lose_attempts(sched, clock, n: int, keep_alive=()) -> None:
+    """Assign the next task to ``n`` fresh workers in turn and let each of them die."""
+    for i in range(n):
+        assert sched.try_assign(f"w{i}") is not None
+        clock.advance(sched.worker_timeout + 1)
+        for w in keep_alive:
+            sched.heartbeat(w, [])
+        sched.check_workers()
+
+
 def test_lost_attempts_do_not_count_as_failures(sched, clock):
     job = submit(sched, maps=1, reduces=1)
-    for i in range(sched.max_task_failures + 2):
-        sched.try_assign(f"w{i}")
-        clock.advance(sched.worker_timeout + 1)
-        sched.check_workers()
+    lose_attempts(sched, clock, sched.max_task_losses - 1)
     assert job.state is JobState.MAPPING
     assert job.maps[0].failures == 0
+    # The two limits are separate: a task can be lost and fail, just under each limit.
+    for i in range(sched.max_task_failures - 1):
+        a = sched.try_assign(f"x{i}")
+        sched.report(f"x{i}", a.attempt_id, False, "boom")
+    assert job.state is JobState.MAPPING
+
+
+def test_task_that_keeps_losing_its_worker_fails_the_job(sched, clock, committer):
+    """A task that crashes its worker (os._exit, segfault, OOM kill) must not loop forever."""
+    job = submit(sched, maps=2, reduces=1)
+    other = sched.try_assign("survivor")
+    lose_attempts(sched, clock, sched.max_task_losses, keep_alive=["survivor"])
+    assert job.state is JobState.FAILED
+    assert f"{job.id}/map-1 lost its worker 3 times" in job.error
+    assert committer.finished == [(job.id, False)]
+    # The healthy attempt on the surviving worker is cancelled too.
+    assert sched.heartbeat("survivor", [other.attempt_id]) == [other.attempt_id]
+
+
+def test_restart_under_same_name_counts_as_a_loss(sched):
+    job = submit(sched, maps=1, reduces=1)
+    sched.try_assign("w1")
+    for _ in range(sched.max_task_losses):
+        sched.try_assign("w1")  # w1 keeps restarting while it runs map-0
+    assert job.state is JobState.FAILED
+    assert job.maps[0].losses == sched.max_task_losses
 
 
 def test_returning_worker_is_told_to_cancel_and_its_report_is_ignored(sched, clock):
@@ -336,6 +369,19 @@ def test_short_tasks_are_not_speculated(sched, clock):
     start_wave(sched, clock, job, ["w1", "w2"], finish=["w1"], duration=0.1)
     clock.advance(0.5)  # 6x the median, but below the 1 s minimum
     assert sched.try_assign("w1") is None
+
+
+def test_older_jobs_backups_come_before_newer_jobs_tasks(sched, clock):
+    """FIFO priority covers backups: a queued job must not starve older stragglers."""
+    first = submit(sched, maps=2, reduces=1)
+    start_wave(sched, clock, first, ["w1", "w2"], finish=["w1"])
+    second = submit(sched, maps=1, reduces=1)
+    clock.advance(5)
+    backup = sched.try_assign("w1")
+    assert backup.job_id == first.id and backup.task_index == 1
+    assert first.maps[1].attempts[1].speculative
+    # The next idle worker gets the newer job's work.
+    assert sched.try_assign("w3").job_id == second.id
 
 
 def test_speculation_can_be_disabled_per_job(sched, clock):

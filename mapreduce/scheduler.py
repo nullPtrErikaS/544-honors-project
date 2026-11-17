@@ -28,6 +28,7 @@ from mapreduce.splits import Segment
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_TASK_FAILURES = 4
+DEFAULT_MAX_TASK_LOSSES = 3  # a task that keeps losing its worker is probably killing it
 DEFAULT_WORKER_TIMEOUT = 5.0  # seconds of silence before a worker is declared dead
 DEFAULT_SPECULATION_FACTOR = 1.5  # straggler = running longer than 1.5x the median task
 DEFAULT_SPECULATION_MIN_RUNTIME = 1.0  # ...and longer than this many seconds
@@ -97,6 +98,7 @@ class Task:
     attempts: list[Attempt] = field(default_factory=list)
     committed: Attempt | None = None
     failures: int = 0
+    losses: int = 0
 
     @property
     def name(self) -> str:
@@ -180,6 +182,7 @@ class Scheduler:
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         max_task_failures: int = DEFAULT_MAX_TASK_FAILURES,
+        max_task_losses: int = DEFAULT_MAX_TASK_LOSSES,
         worker_timeout: float = DEFAULT_WORKER_TIMEOUT,
         speculation_factor: float = DEFAULT_SPECULATION_FACTOR,
         speculation_min_runtime: float = DEFAULT_SPECULATION_MIN_RUNTIME,
@@ -188,6 +191,7 @@ class Scheduler:
         self.clock = clock
         self.wall_clock = wall_clock
         self.max_task_failures = max_task_failures
+        self.max_task_losses = max_task_losses
         self.worker_timeout = worker_timeout
         self.speculation_factor = speculation_factor
         self.speculation_min_runtime = speculation_min_runtime
@@ -318,13 +322,15 @@ class Scheduler:
     # ------------------------------------------------------------------ policy
 
     def _choose(self, worker_id: str) -> Attempt | None:
-        """Pick work for an idle worker: pending tasks first, then backups of stragglers."""
-        active = self.active_jobs()
-        for job in active:
+        """Pick work for an idle worker from the oldest job that has any.
+
+        Within a job, pending tasks come first, then a backup of a straggler. Only then do
+        we look at later jobs, so a queued job can't starve an older job's stragglers.
+        """
+        for job in self.active_jobs():
             for task in job.phase_tasks():
                 if task.pending:
                     return self._launch(task, worker_id)
-        for job in active:
             if job.spec.speculative and (straggler := self._straggler(job, worker_id)):
                 return self._launch(straggler, worker_id, speculative=True)
         return None
@@ -428,10 +434,25 @@ class Scheduler:
 
     def _lose(self, attempt: Attempt, reason: str) -> None:
         """An attempt's worker died. The task becomes pending again unless another attempt
-        is still running. Lost attempts don't count toward the task's failure limit."""
+        is still running.
+
+        A lost attempt is usually the worker's fault, not the task's, so it doesn't count
+        toward the failure limit. But a task whose code kills its worker (``os._exit``, a
+        segfault, an out-of-memory kill) would be retried until no workers were left, so
+        a task that loses its worker ``max_task_losses`` times fails the job.
+        """
         log.warning("%s lost: %s", attempt.id, reason)
         self._stop(attempt, AttemptState.LOST)
         attempt.error = reason
+        task = attempt.task
+        task.losses += 1
+        if task.losses >= self.max_task_losses and not task.job.state.finished:
+            self._finish(
+                task.job,
+                JobState.FAILED,
+                f"{task.name} lost its worker {task.losses} times; its code may be crashing "
+                f"the worker process (last: {reason})",
+            )
 
     def _stop(self, attempt: Attempt, state: AttemptState) -> None:
         attempt.state, attempt.end = state, self.clock()
