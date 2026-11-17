@@ -42,8 +42,11 @@ docker compose up -d --build
 ```
 
 This builds one image, `mapreduce:latest`. The protobuf/gRPC code is generated inside it
-during the build. Compose then starts `boss` (port 5440 on the host) and `worker1`–`worker4`,
-each limited to 1 CPU, all mounting the `mrdata` volume at `/data`.
+during the build. Compose then starts `boss` and `worker1`–`worker4`, each worker limited to
+1 CPU, all mounting the `mrdata` volume at `/data`. The boss listens on `127.0.0.1:5440`
+only. It has no authentication and runs any job code it is sent, so it is not exposed to the
+network. To use a client on another machine, tunnel the port:
+`ssh -L 5440:localhost:5440 <vm>`.
 
 ### 1.2 Install the client
 
@@ -147,27 +150,37 @@ def reducer(key, values):
 
 
 # Optional: pre-aggregate counts on the map side before the shuffle. A combiner has the
-# reducer's signature and must keep the key. Summing is associative, so the reducer works.
+# reducer's signature and must keep the key. It may run zero or several times per key, so
+# it must be associative and commutative and emit the kind of values it receives. Summing
+# counts qualifies, so the reducer can be reused.
 combiner = reducer
 ```
 
 The contract:
 
 - **Input**: text files. `mapper(key, value)` is called once per line, with `key` = the
-  input file's path in shared storage and `value` = the line without its newline.
+  input file's path in shared storage and `value` = the line without its `\n` or `\r\n`.
+  Lines are decoded as UTF-8; invalid bytes become U+FFFD instead of failing the task.
   `--input` may be a file or a directory (read recursively; names starting with `_` or `.`
   are skipped). The input is split into `--maps` byte ranges of equal size, regardless of
   how many files there are.
 - **Mapper, reducer, and combiner** `yield` (or return a list of) `(key, value)` pairs.
   Keys and values must be JSON-serializable: str, int, float, bool, None, list, or dict.
+  Keys are compared by their JSON encoding, so `1`, `1.0`, and `True` are different keys
+  and a tuple key reaches the reducer as a list.
 - **reducer(key, values)** receives every value for one key as an iterator. Keys are
   partitioned across `--reduces` reduce tasks by a stable hash, and each reduce task sees
   its keys in sorted order.
-- **combiner(key, values)** is optional. It must emit the same key it was given. Jobs run
-  it by default; disable it with `--no-combiner`.
+- **combiner(key, values)** is optional. Jobs run it by default; disable it with
+  `--no-combiner`. It may run zero times or several times on the same key (at every spill
+  and again at the final merge), so it must emit the same key it was given, be associative
+  and commutative, and emit values its own input and the reducer accept. A reducer that
+  computes an average is not a valid combiner; emit `(sum, count)` pairs instead.
 - **Output**: `--output` becomes a directory of `part-r-NNNNN` files (one per reduce task)
-  plus `_SUCCESS`. Each line is `key<TAB>value`; strings are written as-is and everything
-  else as JSON.
+  plus `_SUCCESS`. Each line is `key<TAB>value`. Strings are written as-is, unless they
+  contain a tab or line break, in which case they are JSON-encoded. Everything else is
+  written as JSON. A job that reads this output gets each line as text and parses the
+  fields itself. A failed job leaves no output directory.
 - Functions must be **deterministic**, because tasks can run more than once (retries and
   backups).
 
@@ -185,14 +198,18 @@ some/local/dir`. A second example,
 
 If the user code raises, the attempt fails and is retried on another worker. After 4
 failures of one task the job fails, and `./mr status <job>` shows the remote traceback with
-your file's line numbers.
+your file's line numbers. If the code crashes the worker process instead (for example
+`os._exit`, a segfault, or running out of memory), the attempt is `LOST`. After 3 lost
+attempts of one task the job fails, so a task like that can't take down every worker.
 
 ---
 
 ## 3. Client reference
 
 All commands talk to `$MR_BOSS` (default `localhost:5440`). Storage paths are relative to
-the shared volume's root.
+the shared volume's root. A leading `/` means the same thing, and `..` is rejected. While a
+job is queued or running, `rm`, `upload`, and `submit --overwrite` are refused on anything
+that overlaps its input or output, and a job can't read another job's unfinished output.
 
 | Command | Description |
 |---|---|
@@ -347,6 +364,9 @@ the rest of the job.
 
 - The boss is a single point of failure (as in the MapReduce paper). If it dies, in-flight
   jobs are lost.
+- There is no authentication, so the boss is bound to the host's loopback interface.
+- Jobs get workers in FIFO priority order, with no fairness between users: a later job only
+  uses workers the earlier jobs can't keep busy.
 - Python and JSON make per-worker throughput modest (about 2.4 MiB/s for word count on one CPU).
   Scalability, not raw speed, was the goal.
 - All storage is one Docker volume, so there is no data locality to exploit. This is fine on
@@ -358,7 +378,7 @@ the rest of the job.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # about 30 s; generates the protobuf code automatically if needed
+pytest          # about a minute; generates the protobuf code automatically if needed
 ruff check . && ruff format --check .
 ```
 
@@ -368,8 +388,9 @@ ruff check . && ruff format --check .
 | `tests/test_kv.py` | Partitioner is stable across processes (different `PYTHONHASHSEED`), sorted-run merge, output format |
 | `tests/test_jobcode.py` | Job file validation without executing it, loading, tracebacks show user source lines |
 | `tests/test_tasks.py` | Map and reduce tasks against the sequential oracle for various M/R and spill thresholds; combiner correctness and data reduction; cancellation |
-| `tests/test_scheduler.py` | Scheduler state machine with a fake clock: phases, FIFO, retries and failure limit, dead workers, rejoining workers, speculation thresholds and winners |
-| `tests/test_integration.py` | Real boss and worker **processes** over gRPC: output equals `mr local`, storage RPCs, error handling, the CLI, a worker killed mid-job, a 25× slower worker beaten by backups, combiner on/off |
+| `tests/test_scheduler.py` | Scheduler state machine with a fake clock: phases, FIFO priority (including backups), retries and failure limit, lost-attempt limit, dead workers, rejoining workers, speculation thresholds and winners |
+| `tests/test_jobfiles.py` | Job directories on storage: setup, commit, cleanup on success and failure, and a killed attempt can't recreate a finished job's directories |
+| `tests/test_integration.py` | Real boss and worker **processes** over gRPC: output equals `mr local`, storage RPCs, error handling, the CLI, a worker killed mid-job, a 25× slower worker beaten by backups, combiner on/off, data in use is locked, failed jobs leave no output |
 
 GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every pull
 request:
